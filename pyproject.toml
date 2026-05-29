@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safefile"                # ⚠️ Change to "safefile-YOURUSERNAME" if taken on PyPI
+version = "0.2.0"
+description = "Transactional file modifications – atomic, rollback on failure"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Abir Hasan Supta", email = "abirhasan.supta254@gmail.com"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Filesystems",
+]
+requires-python = ">=3.7"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/AbirHasanSupta/safefile"
+Repository = "https://github.com/AbirHasanSupta/safefile"
+"Issue Tracker" = "https://github.com/AbirHasanSupta/safefile/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
