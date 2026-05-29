@@ -3,8 +3,8 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "safefile"                # ⚠️ Change to "safefile-YOURUSERNAME" if taken on PyPI
-version = "0.1.0"
+name = "safefile"
+version = "0.2.0"
 description = "Transactional file modifications – atomic, rollback on failure"
 readme = "README.md"
 license = {text = "MIT"}
