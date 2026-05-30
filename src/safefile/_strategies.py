@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shutil
 from abc import ABC, abstractmethod
@@ -17,9 +18,37 @@ class BackupStrategy(ABC):
     def restore_dir(self, backup: str, original: str) -> None: ...
 
 
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 class CopyStrategy(BackupStrategy):
+    def __init__(self, chunk_size: int = 50 * 1024 * 1024, on_progress=None) -> None:
+        self._chunk_size = chunk_size
+        self._on_progress = on_progress
+
     def backup(self, src: str, dest: str) -> None:
-        shutil.copy2(src, dest)
+        size = os.path.getsize(src)
+        if self._on_progress and size > self._chunk_size:
+            self._chunked_copy(src, dest, size)
+        else:
+            shutil.copy2(src, dest)
+
+    def _chunked_copy(self, src: str, dest: str, size: int) -> None:
+        written = 0
+        with open(src, "rb") as fsrc, open(dest, "wb") as fdst:
+            while True:
+                chunk = fsrc.read(self._chunk_size)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                written += len(chunk)
+                self._on_progress(int(written * 100 / size))
+        shutil.copystat(src, dest)
 
     def restore(self, backup: str, original: str) -> None:
         os.replace(backup, original)
@@ -34,25 +63,15 @@ class CopyStrategy(BackupStrategy):
 
 
 class HardlinkStrategy(BackupStrategy):
-    """
-    Backup: attempts os.link() for near-instant snapshot (no data copy).
-    Falls back to copy if the temp dir is on a different filesystem.
-
-    Restore: detects whether the original and backup still share the same
-    inode (meaning the file was truncated-in-place rather than replaced).
-    In that case the shared inode already has the mutated content, so the
-    strategy transparently fell back to a real copy at backup time.
-    If inodes differ (file was atomically replaced by the user code) os.replace
-    is sufficient and fast.
-    """
+    def __init__(self, chunk_size: int = 50 * 1024 * 1024, on_progress=None) -> None:
+        self._chunk_size = chunk_size
+        self._on_progress = on_progress
 
     def backup(self, src: str, dest: str) -> None:
         try:
             os.link(src, dest)
-            # Verify the hardlink succeeded and inodes match
             if os.stat(src).st_ino != os.stat(dest).st_ino:
                 raise OSError("inode mismatch after link")
-            # Store a real copy alongside as a safety net for in-place writes
             shutil.copy2(src, dest + ".shadow")
         except OSError:
             shutil.copy2(src, dest)
@@ -60,17 +79,13 @@ class HardlinkStrategy(BackupStrategy):
     def restore(self, backup: str, original: str) -> None:
         shadow = backup + ".shadow"
         if os.path.exists(shadow):
-            # Hardlink was used — restore from the shadow copy (guaranteed clean)
             os.replace(shadow, original)
             if os.path.exists(backup):
                 os.remove(backup)
         else:
-            # Fell back to copy — simple replace
             os.replace(backup, original)
 
     def backup_dir(self, src: str, dest: str) -> None:
-        # For directories, always use a full copy — trees can't be hardlinked atomically
-        # and detecting in-place mutations across a tree is unreliable.
         os.makedirs(dest, exist_ok=True)
         for dirpath, dirnames, filenames in os.walk(src):
             rel = os.path.relpath(dirpath, src)
@@ -93,8 +108,8 @@ _STRATEGIES = {
 }
 
 
-def get_strategy(name: str) -> BackupStrategy:
+def get_strategy(name: str, chunk_size: int = 50 * 1024 * 1024, on_progress=None) -> BackupStrategy:
     cls = _STRATEGIES.get(name)
     if cls is None:
         raise ValueError(f"Unknown strategy '{name}'. Choose from: {list(_STRATEGIES)}")
-    return cls()
+    return cls(chunk_size=chunk_size, on_progress=on_progress)
