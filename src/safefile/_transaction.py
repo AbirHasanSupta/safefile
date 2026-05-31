@@ -3,12 +3,13 @@ import hashlib
 import os
 import shutil
 import tempfile
-from typing import Callable, Dict, Iterator, List, Optional, Set, Union
+from typing import Callable, Dict, List, Optional, Set, Union
 
 from ._strategies import BackupStrategy, get_strategy
 from ._savepoint import Savepoint
 from ._lazy import LazyWatcher
 from ._dryrun import DryRunProxy
+from ._journal import write_journal, mark_committed
 
 
 def _sha256(path: str) -> str:
@@ -29,10 +30,12 @@ class Transaction:
         lazy: bool = False,
         dry_run: bool = False,
         verify: bool = False,
+        journal: bool = True,
         chunk_size: int = 50 * 1024 * 1024,
         on_progress: Optional[Callable[[int], None]] = None,
     ) -> None:
         self.filepaths = filepaths
+        self._strategy_name = strategy
         self._strategy: BackupStrategy = get_strategy(
             strategy, chunk_size=chunk_size, on_progress=on_progress
         )
@@ -41,6 +44,7 @@ class Transaction:
         self._lazy = lazy
         self._dry_run = dry_run
         self._verify = verify
+        self._journal = journal
         self._backups: Dict[str, str] = {}
         self._checksums: Dict[str, str] = {}
         self._new_paths: Set[str] = set()
@@ -65,10 +69,12 @@ class Transaction:
         for fp in self.filepaths:
             self._register(fp)
 
+        if self._journal and self._backups:
+            self._write_journal()
+
         return self
 
     def _register(self, fp: str) -> None:
-        """Back up a single path (file or dir). Safe to call multiple times."""
         if fp in self._backups or fp in self._new_paths:
             return
         if os.path.isdir(fp):
@@ -89,6 +95,20 @@ class Transaction:
         else:
             self._new_paths.add(fp)
 
+        # re-write journal whenever registration state changes
+        if self._journal and self._temp_dir and not self._dry_run:
+            self._write_journal()
+
+    def _write_journal(self) -> None:
+        write_journal(
+            temp_dir=self._temp_dir,
+            filepaths=list(self.filepaths),
+            backups=self._backups,
+            new_paths=self._new_paths,
+            dirs=self._dirs,
+            strategy=self._strategy_name,
+        )
+
     # ── exit ──────────────────────────────────────────────────────────────────
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
@@ -102,6 +122,8 @@ class Transaction:
         self._savepoints.clear()
 
         if exc_type is None:
+            if self._journal and self._temp_dir:
+                mark_committed(self._temp_dir)
             self._cleanup_temp()
             if self._on_commit:
                 self._on_commit()
@@ -114,7 +136,6 @@ class Transaction:
     # ── savepoints ────────────────────────────────────────────────────────────
 
     def savepoint(self) -> Savepoint:
-        """Snapshot current file states mid-transaction. Returns a Savepoint."""
         sp = Savepoint(
             self._strategy,
             self._backups,
@@ -127,10 +148,6 @@ class Transaction:
         return sp
 
     def rollback_to(self, sp: Savepoint) -> None:
-        """
-        Restore files to the state they were in when sp was created.
-        Savepoints created after sp are discarded.
-        """
         idx = self._savepoints.index(sp)
         for later_sp in self._savepoints[idx + 1:]:
             later_sp.discard()
@@ -140,25 +157,40 @@ class Transaction:
     # ── rollback ──────────────────────────────────────────────────────────────
 
     def _rollback(self) -> None:
+        errors = []
         for original, backup in self._backups.items():
-            if original in self._dirs:
-                self._strategy.restore_dir(backup, original)
-            else:
-                self._strategy.restore(backup, original)
-                if self._verify and original in self._checksums:
-                    restored = _sha256(original)
-                    expected = self._checksums[original]
-                    if restored != expected:
-                        raise RuntimeError(
-                            f"Checksum mismatch after restoring '{original}': "
-                            f"expected {expected}, got {restored}"
-                        )
+            try:
+                if original in self._dirs:
+                    self._strategy.restore_dir(backup, original)
+                else:
+                    self._strategy.restore(backup, original)
+                    if self._verify and original in self._checksums:
+                        restored = _sha256(original)
+                        expected = self._checksums[original]
+                        if restored != expected:
+                            raise RuntimeError(
+                                f"Checksum mismatch after restoring '{original}': "
+                                f"expected {expected}, got {restored}"
+                            )
+            except Exception as e:
+                errors.append(e)
+
         for fp in self._new_paths:
-            if os.path.isdir(fp):
-                shutil.rmtree(fp, ignore_errors=True)
-            elif os.path.exists(fp):
-                os.remove(fp)
+            try:
+                if os.path.isdir(fp):
+                    shutil.rmtree(fp, ignore_errors=True)
+                elif os.path.exists(fp):
+                    os.remove(fp)
+            except Exception as e:
+                errors.append(e)
+
         self._cleanup_temp()
+
+        if errors:
+            raise RuntimeError(
+                f"Rollback completed with {len(errors)} error(s): "
+                + "; ".join(str(e) for e in errors)
+            )
 
     def _cleanup_temp(self) -> None:
         if self._temp_dir and os.path.isdir(self._temp_dir):
@@ -168,18 +200,12 @@ class Transaction:
 # ── async wrapper ─────────────────────────────────────────────────────────────
 
 class AsyncTransaction:
-    """
-    Async context manager. Backup/restore run in a thread pool to avoid
-    blocking the event loop. Zero extra dependencies (uses asyncio.to_thread).
-    """
-
     def __init__(self, *filepaths: str, **kwargs) -> None:
         self._tx = Transaction(*filepaths, **kwargs)
 
     async def __aenter__(self) -> Transaction:
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, self._tx.__enter__)
-        return result
+        return await loop.run_in_executor(None, self._tx.__enter__)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
         loop = asyncio.get_event_loop()

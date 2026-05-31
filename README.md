@@ -155,7 +155,7 @@ with transaction("critical.db", verify=True):
 
 ## Streaming backup with progress
 
-For large files, backup runs in configurable chunks and reports progress.
+For large files, backup runs in configurable chunks and reports progress. The backup streams through a `.part` file and is atomically renamed on completion — a mid-copy crash never leaves a half-written backup on disk.
 
 ```python
 with transaction(
@@ -170,23 +170,144 @@ with transaction(
 
 ---
 
+## Crash recovery (journal)
+
+By default, every transaction writes a journal file into its temp directory before touching any files. If your process is killed mid-transaction (SIGKILL, power loss, OOM), the backup and journal survive. On your next startup, call `recover_orphaned()` to detect and restore them automatically.
+
+```python
+from safefile import recover_orphaned
+
+# call once at app startup, before any other file work
+recovered = recover_orphaned(verbose=True)
+print(f"{recovered} orphaned transaction(s) recovered")
+```
+
+To inspect pending orphans without restoring them, use `find_orphaned_journals()`:
+
+```python
+from safefile import find_orphaned_journals
+
+orphans = find_orphaned_journals()
+for o in orphans:
+    print(o["temp_dir"], list(o["backups"].keys()))
+```
+
+The journal is written atomically (`fsync` + `os.replace`) before any file is modified, and marked `committed` on clean exit. Only `open` journals trigger recovery — committed ones are never touched.
+
+Disable journaling for short-lived or test transactions:
+
+```python
+with transaction("tmp.txt", journal=False):
+    ...
+```
+
+---
+
+## Resilient rollback
+
+If restoring one file fails during rollback (e.g. a permission error or full disk), safefile continues restoring all remaining files and then raises a single `RuntimeError` summarising every failure. No file is silently skipped.
+
+---
+
 ## All options
 
 ```python
 transaction(
     *filepaths,
     strategy="copy",        # "copy" (default) or "hardlink"
-    on_commit=None,         # callable, fired on success
-    on_rollback=None,       # callable, fired on failure
+    on_commit=None,         # callable fired on success
+    on_rollback=None,       # callable fired on failure
     lazy=False,             # defer backup until tx.touch(path) is called
     dry_run=False,          # redirect writes to shadow copies, never touch originals
     verify=False,           # SHA-256 checksum check after rollback
-    chunk_size=52428800,    # bytes threshold for chunked streaming (default 50 MB)
-    on_progress=None,       # callable(int) receiving 0–100 during large-file backup
+    journal=True,           # write crash-recovery journal (default on)
+    chunk_size=52428800,    # streaming threshold in bytes (default 50 MB)
+    on_progress=None,       # callable(int 0–100) during large-file backup
 )
 ```
 
 `async_transaction` accepts the same options.
+
+---
+
+## CLI (`safefile` command)
+
+### Protect files around any shell command
+
+```bash
+safefile run --protect config.yaml data.csv -- python deploy.py
+```
+
+If `deploy.py` exits non-zero or crashes, both files are restored automatically.
+
+```bash
+# options
+safefile run --protect FILE [FILE ...]   # files/dirs to protect (required)
+             --strategy copy|hardlink    # backup strategy (default: copy)
+             --verify                    # SHA-256 verify after restore
+             --no-journal                # skip crash-recovery journal
+             --progress                  # show backup progress for large files
+             --verbose / -v              # print transaction lifecycle messages
+             -- COMMAND [ARGS ...]       # command to run
+```
+
+### Recover after a crash
+
+```bash
+safefile recover              # interactive prompt listing what will be restored
+safefile recover --yes        # skip confirmation
+safefile recover --dry-run    # show what would be recovered, do nothing
+safefile recover --verbose    # print each file as it is restored
+```
+
+### Check for pending recoveries
+
+```bash
+safefile status    # exits 0 if clean, exits 1 if orphaned transactions exist
+```
+
+Useful in CI pre-flight checks or deploy scripts.
+
+---
+
+## pytest plugin
+
+safefile registers automatically as a pytest plugin when installed — no imports or configuration needed. Use `safefile_guard` as a fixture argument and call `guard.protect(*paths)` to snapshot files; they are restored unconditionally after the test, whether it passes or fails.
+
+```python
+def test_deploy(safefile_guard, tmp_path):
+    config = str(tmp_path / "config.yaml")
+    write_fixture(config)
+    safefile_guard.protect(config)    # snapshot it
+    run_deploy_pipeline(config)       # mutates config
+    assert something_about(config)
+    # config is restored automatically after the test — no teardown needed
+```
+
+`protect()` can be called at any point during the test, including mid-test after a first stage completes:
+
+```python
+def test_multi_stage(safefile_guard):
+    safefile_guard.protect("a.yaml")
+    stage_one("a.yaml")
+    safefile_guard.protect("b.db")    # added mid-test
+    stage_two("b.db")
+    # both files restored on teardown
+```
+
+Three fixture variants are available — all auto-registered, no imports needed:
+
+```python
+def test_a(safefile_guard):           ...  # copy strategy (default)
+def test_b(safefile_guard_hardlink):  ...  # hardlink strategy — faster for large files
+def test_c(safefile_guard_verify):    ...  # copy + SHA-256 checksum verify on restore
+```
+
+If the plugin fixtures are not auto-discovered (e.g. the package is not installed via `pip install -e .`), add a `conftest.py` at your project root:
+
+```python
+from safefile._pytest_plugin import safefile_guard, safefile_guard_hardlink, safefile_guard_verify
+```
 
 ---
 
