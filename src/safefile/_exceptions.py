@@ -1,5 +1,9 @@
+from typing import List
+
+
 class SafefileError(Exception):
     """Base exception for all safefile errors."""
+    pass
 
 
 class BackupError(SafefileError):
@@ -26,8 +30,8 @@ class RollbackError(SafefileError):
     All restorable files are still restored before this is raised.
     """
 
-    def __init__(self, errors: list) -> None:
-        self.errors: list = errors
+    def __init__(self, errors: List[Exception]) -> None:
+        self.errors: List[Exception] = errors
         summary = "; ".join(str(e) for e in errors)
         super().__init__(
             f"Rollback completed with {len(errors)} error(s): {summary}"
@@ -58,3 +62,4 @@ class JournalError(SafefileError):
 
 class StrategyError(SafefileError):
     """Raised when an unknown or invalid backup strategy is requested."""
+    pass

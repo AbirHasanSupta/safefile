@@ -1,7 +1,10 @@
 import os
 import shutil
 import tempfile
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List
+
+if TYPE_CHECKING:
+    from ._strategies import BackupStrategy
 
 
 class DryRunProxy:
@@ -54,6 +57,7 @@ class DryRunProxy:
 
     def rollback_to(self, sp: "_DryRunSavepoint") -> None:
         """No-op: dry_run mode has no real state to roll back."""
+        pass
 
     def cleanup(self) -> None:
         if os.path.isdir(self._shadow_dir):

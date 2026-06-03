@@ -1,6 +1,4 @@
-from typing import Callable, Dict, List, Optional, Set, Union, overload
-
-# ── exceptions ────────────────────────────────────────────────────────────────
+from typing import Callable, Dict, List, Optional, overload
 
 class SafefileError(Exception): ...
 
@@ -31,8 +29,6 @@ class JournalError(SafefileError):
 
 class StrategyError(SafefileError): ...
 
-# ── strategies ────────────────────────────────────────────────────────────────
-
 class BackupStrategy:
     def backup(self, src: str, dest: str) -> None: ...
     def restore(self, backup: str, original: str) -> None: ...
@@ -59,18 +55,12 @@ def get_strategy(
     on_progress: Optional[Callable[[int], None]] = ...,
 ) -> BackupStrategy: ...
 
-# ── savepoint ─────────────────────────────────────────────────────────────────
-
 class Savepoint:
     def restore(self) -> None: ...
     def discard(self) -> None: ...
 
-# ── lazy ──────────────────────────────────────────────────────────────────────
-
 class LazyWatcher:
     def touch(self, *paths: str) -> None: ...
-
-# ── dryrun ────────────────────────────────────────────────────────────────────
 
 class DryRunProxy:
     def path(self, original: str) -> str: ...
@@ -80,10 +70,8 @@ class DryRunProxy:
     def rollback_to(self, sp: object) -> None: ...
     def cleanup(self) -> None: ...
 
-# ── transaction ───────────────────────────────────────────────────────────────
-
 class Transaction:
-    filepaths: tuple
+    filepaths: "tuple[str, ...]"
 
     def __init__(
         self,
@@ -102,9 +90,9 @@ class Transaction:
     @overload
     def __enter__(self: "Transaction") -> "Transaction": ...
     @overload
-    def __enter__(self: "Transaction") -> LazyWatcher: ...
+    def __enter__(self: "Transaction") -> LazyWatcher: ...  # type: ignore[overload-cannot-match]
     @overload
-    def __enter__(self: "Transaction") -> DryRunProxy: ...
+    def __enter__(self: "Transaction") -> DryRunProxy: ...  # type: ignore[overload-cannot-match]
 
     def __exit__(
         self,
@@ -126,18 +114,12 @@ class AsyncTransaction:
         exc_tb: object,
     ) -> bool: ...
 
-# ── journal ───────────────────────────────────────────────────────────────────
-
 def recover_orphaned(verbose: bool = ...) -> int: ...
-def find_orphaned_journals() -> List[Dict]: ...
-
-# ── pytest plugin ─────────────────────────────────────────────────────────────
+def find_orphaned_journals() -> List[Dict[str, object]]: ...
 
 class SafefileGuard:
     def __init__(self, strategy: str = ..., verify: bool = ...) -> None: ...
     def protect(self, *paths: str) -> None: ...
-
-# ── public factory functions ──────────────────────────────────────────────────
 
 def transaction(
     *filepaths: str,

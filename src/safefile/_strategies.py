@@ -1,8 +1,8 @@
 import errno
-import hashlib
 import os
 import shutil
 from abc import ABC, abstractmethod
+from typing import Any, Callable, Dict, Optional
 
 from ._exceptions import BackupError, RestoreError, StrategyError
 
@@ -24,8 +24,8 @@ def _safe_replace(src: str, dest: str) -> None:
         winerror = getattr(exc, "winerror", None)
         needs_fallback = (
             exc.errno in (errno.EXDEV, errno.EACCES, errno.EPERM)
-            or winerror == 5   # ERROR_ACCESS_DENIED
-            or winerror == 17  # ERROR_NOT_SAME_DEVICE (Windows EXDEV equivalent)
+            or winerror == 5
+            or winerror == 17
         )
         if not needs_fallback:
             raise
@@ -54,7 +54,7 @@ class BackupStrategy(ABC):
 
 
 class CopyStrategy(BackupStrategy):
-    def __init__(self, chunk_size: int = 50 * 1024 * 1024, on_progress=None) -> None:
+    def __init__(self, chunk_size: int = 50 * 1024 * 1024, on_progress: Optional[Callable[[int], None]] = None) -> None:
         self._chunk_size = chunk_size
         self._on_progress = on_progress
 
@@ -79,7 +79,8 @@ class CopyStrategy(BackupStrategy):
                         break
                     fdst.write(chunk)
                     written += len(chunk)
-                    self._on_progress(int(written * 100 / size))
+                    if self._on_progress:
+                        self._on_progress(int(written * 100 / size))
                 fdst.flush()
                 try:
                     os.fsync(fdst.fileno())
@@ -100,7 +101,6 @@ class CopyStrategy(BackupStrategy):
             _safe_replace(backup, original)
         except OSError as exc:
             raise RestoreError(original, str(exc)) from exc
-
 
     def backup_dir(self, src: str, dest: str) -> None:
         try:
@@ -148,8 +148,7 @@ class HardlinkStrategy(BackupStrategy):
     FAT32, some network filesystems).  In that case no shadow is written
     because the plain copy already contains the original content.
     """
-
-    def __init__(self, chunk_size: int = 50 * 1024 * 1024, on_progress=None) -> None:
+    def __init__(self, chunk_size: int = 50 * 1024 * 1024, on_progress: Optional[Callable[[int], None]] = None) -> None:
         self._chunk_size = chunk_size
         self._on_progress = on_progress
 
@@ -157,14 +156,12 @@ class HardlinkStrategy(BackupStrategy):
         try:
             os.link(src, dest)
         except OSError:
-            # Cross-device or unsupported filesystem: plain copy (no shadow needed).
             try:
                 shutil.copy2(src, dest)
             except OSError as exc:
                 raise BackupError(src, str(exc)) from exc
             return
 
-        # Hardlink succeeded: write shadow copy for in-place-write protection.
         shadow = dest + ".shadow"
         try:
             size = os.path.getsize(src)
@@ -173,8 +170,6 @@ class HardlinkStrategy(BackupStrategy):
             else:
                 shutil.copy2(src, shadow)
         except OSError as exc:
-            # Shadow creation failed — clean up the dangling hardlink and
-            # re-raise so the caller falls back to CopyStrategy if desired.
             try:
                 os.remove(dest)
             except OSError:
@@ -189,7 +184,8 @@ class HardlinkStrategy(BackupStrategy):
                 for chunk in iter(lambda: fsrc.read(self._chunk_size), b""):
                     fdst.write(chunk)
                     written += len(chunk)
-                    self._on_progress(int(written * 100 / size))
+                    if self._on_progress:
+                        self._on_progress(int(written * 100 / size))
                 fdst.flush()
                 try:
                     os.fsync(fdst.fileno())
@@ -209,16 +205,11 @@ class HardlinkStrategy(BackupStrategy):
         shadow = backup + ".shadow"
         try:
             if os.path.exists(shadow):
-                # Hardlink strategy was used.  Decide which copy to restore from.
                 if os.path.exists(original) and os.path.exists(backup):
                     try:
                         orig_ino = os.stat(original).st_ino
                         bak_ino = os.stat(backup).st_ino
-                        # Guard: st_ino returns 0 on some Windows filesystems
-                        # when inode information is unavailable — skip fast path.
                         if orig_ino and bak_ino and orig_ino != bak_ino:
-                            # File was atomically replaced: the hardlink still
-                            # holds the original inode — restore with safe rename.
                             _safe_replace(backup, original)
                             try:
                                 os.remove(shadow)
@@ -227,15 +218,12 @@ class HardlinkStrategy(BackupStrategy):
                             return
                     except OSError:
                         pass
-                # In-place write (same inode), unknown inode, or original gone:
-                # use the shadow copy which always holds the original content.
                 _safe_replace(shadow, original)
                 try:
                     os.remove(backup)
                 except OSError:
                     pass
             else:
-                # Cross-device / no-hardlink fallback: backup is a plain copy.
                 _safe_replace(backup, original)
         except OSError as exc:
             raise RestoreError(original, str(exc)) from exc
@@ -252,9 +240,6 @@ class HardlinkStrategy(BackupStrategy):
                 raise
 
     def backup_dir(self, src: str, dest: str) -> None:
-        # Directory backup always uses plain copies. Hardlinks cannot be used
-        # here because restore_dir does a bulk copytree with no per-file inode
-        # check, so an in-place write would silently corrupt the backup.
         try:
             shutil.copytree(src, dest)
         except OSError as exc:
@@ -270,7 +255,7 @@ class HardlinkStrategy(BackupStrategy):
             raise RestoreError(original, str(exc)) from exc
 
 
-_STRATEGIES: dict = {
+_STRATEGIES: Dict[str, Any] = {
     "copy": CopyStrategy,
     "hardlink": HardlinkStrategy,
 }
@@ -279,11 +264,11 @@ _STRATEGIES: dict = {
 def get_strategy(
     name: str,
     chunk_size: int = 50 * 1024 * 1024,
-    on_progress=None,
+    on_progress: Optional[Callable[[int], None]] = None,
 ) -> BackupStrategy:
-    cls = _STRATEGIES.get(name)
+    cls: Any = _STRATEGIES.get(name)
     if cls is None:
         raise StrategyError(
             f"Unknown strategy '{name}'. Choose from: {list(_STRATEGIES)}"
         )
-    return cls(chunk_size=chunk_size, on_progress=on_progress)
+    return cls(chunk_size=chunk_size, on_progress=on_progress)  # type: ignore[no-any-return]

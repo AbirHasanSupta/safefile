@@ -77,7 +77,8 @@ def test_multiple_files():
             raise ValueError
     assert read("c_f1.txt") == "one"
     assert read("c_f2.txt") == "two"
-    rm("c_f1.txt"); rm("c_f2.txt")
+    rm("c_f1.txt")
+    rm("c_f2.txt")
 
 
 # ── hardlink strategy ─────────────────────────────────────────────────────────
@@ -272,7 +273,8 @@ def test_savepoint_rollback_partial():
         write("sp_b.txt", "b-final")
     assert read("sp_a.txt") == "a-step1"
     assert read("sp_b.txt") == "b-final"
-    rm("sp_a.txt"); rm("sp_b.txt")
+    rm("sp_a.txt")
+    rm("sp_b.txt")
 
 def test_savepoint_full_rollback_still_works():
     write("sp_full.txt", "original")
@@ -293,7 +295,7 @@ def test_multiple_savepoints_stack():
         write("sp_m.txt", "v1")
         sp1 = tx.savepoint()
         write("sp_m.txt", "v2")
-        sp2 = tx.savepoint()
+        tx.savepoint()
         write("sp_m.txt", "v3")
         tx.rollback_to(sp1)
         assert read("sp_m.txt") == "v1"
@@ -344,7 +346,8 @@ def test_lazy_backup_only_touched_files():
             raise RuntimeError
     assert read("lz_a.txt") == "a-orig"
     assert read("lz_b.txt") == "b-changed"
-    rm("lz_a.txt"); rm("lz_b.txt")
+    rm("lz_a.txt")
+    rm("lz_b.txt")
 
 def test_lazy_commit_unchanged():
     write("lz_c.txt", "original")
@@ -357,7 +360,7 @@ def test_lazy_commit_unchanged():
 def test_lazy_no_touch_no_backup():
     write("lz_skip.txt", "original")
     with pytest.raises(RuntimeError):
-        with transaction("lz_skip.txt", lazy=True) as tx:
+        with transaction("lz_skip.txt", lazy=True):
             write("lz_skip.txt", "changed")
             raise RuntimeError
     assert read("lz_skip.txt") == "changed"

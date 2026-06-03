@@ -46,9 +46,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[safefile] protecting: {', '.join(filepaths)}")
         print(f"[safefile] strategy: {strategy}  verify: {verify}  journal: {journal}")
 
-    # Build per-file transactions when --progress is requested for multiple
-    # files so each file gets its own progress bar.  For a single file (or
-    # when --progress is not set) use a single combined transaction.
     if args.progress and len(filepaths) > 1:
         return _run_multi_progress(
             filepaths, args.command, strategy, verify, journal, args.verbose
@@ -98,19 +95,6 @@ def _run_multi_progress(filepaths: List[str],
     We accomplish this by backing up sequentially and printing progress per
     file before the command runs.
     """
-    # We create one transaction but monkey-patch on_progress per file by
-    # using individual single-file transactions for backup, then combine
-    # into one outer transaction that shares the same temp dir.
-    #
-    # Simplest correct approach: run each file through its own Transaction
-    # for the backup phase only, collect their temp dirs, then restore all
-    # on failure.  This is clean and avoids coupling to internals.
-    import tempfile
-    import shutil
-    from ._strategies import get_strategy
-    from ._journal import write_journal, mark_committed
-
-    # One combined transaction — progress per-file via pre-registration
     transactions = []
     for fp in filepaths:
         cb = _make_progress_cb(os.path.basename(fp))
@@ -123,7 +107,6 @@ def _run_multi_progress(filepaths: List[str],
         )
         transactions.append(t)
 
-    # Enter all transactions (backs up each file with its progress bar)
     entered = []
     try:
         for t in transactions:
@@ -218,7 +201,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     sub = parser.add_subparsers(dest="subcommand")
 
-    # ── safefile run ──────────────────────────────────────────────────────────
     p_run = sub.add_parser(
         "run",
         help="Run a command with file protection. Files are restored if the command fails.",
@@ -262,7 +244,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Command to run (after --)",
     )
 
-    # ── safefile recover ──────────────────────────────────────────────────────
     p_rec = sub.add_parser(
         "recover",
         help="Restore files from orphaned crash-recovery journals.",
@@ -271,7 +252,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_rec.add_argument("--dry-run", "-n", action="store_true", help="Show what would be recovered without doing it")
     p_rec.add_argument("--verbose", "-v", action="store_true")
 
-    # ── safefile status ───────────────────────────────────────────────────────
     sub.add_parser(
         "status",
         help="List any pending orphaned transactions (exit 1 if any found).",

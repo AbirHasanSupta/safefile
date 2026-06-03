@@ -13,7 +13,6 @@ from ._lazy import LazyWatcher
 from ._dryrun import DryRunProxy
 from ._journal import write_journal, mark_committed
 from ._exceptions import (
-    BackupError,
     ChecksumMismatchError,
     RestoreError,
     RollbackError,
@@ -61,14 +60,11 @@ class Transaction:
         self._savepoints: List[Savepoint] = []
         self._sp_counter: int = 0
         self._dry_proxy: Optional[DryRunProxy] = None
-        # thread safety: all mutations to shared state go through this lock
         self._lock = threading.RLock()
-
-    # ── enter ─────────────────────────────────────────────────────────────────
 
     def __enter__(self) -> Union["Transaction", LazyWatcher, DryRunProxy]:
         if self._dry_run:
-            self._dry_proxy = DryRunProxy(self.filepaths, self._strategy)
+            self._dry_proxy = DryRunProxy(list(self.filepaths), self._strategy)
             return self._dry_proxy
 
         self._temp_dir = tempfile.mkdtemp(prefix="safefile_")
@@ -123,8 +119,6 @@ class Transaction:
             strategy=self._strategy_name,
         )
 
-    # ── exit ──────────────────────────────────────────────────────────────────
-
     def __exit__(self,
                  exc_type: Optional[Type[BaseException]],
                  exc_val: Optional[BaseException],
@@ -151,8 +145,6 @@ class Transaction:
                 self._on_rollback()
         return False
 
-    # ── savepoints ────────────────────────────────────────────────────────────
-
     def savepoint(self) -> Savepoint:
         with self._lock:
             sp = Savepoint(
@@ -175,11 +167,6 @@ class Transaction:
 
             sp.restore()
 
-            # Undo registrations that happened AFTER this savepoint was taken.
-            #
-            # Case A – files backed up post-savepoint (existed at _register time
-            #          but were unknown at savepoint time): delete from disk and
-            #          discard the orphan backup sitting in our temp dir.
             post_backed = set(self._backups.keys()) - set(sp._backups.keys())
             for fp in post_backed:
                 backup_path = self._backups.get(fp)
@@ -199,8 +186,6 @@ class Transaction:
                     except OSError:
                         pass
 
-            # Case B – paths registered as new (didn't exist) post-savepoint:
-            #          delete if they were subsequently created on disk.
             post_new = self._new_paths - sp._new_paths
             for fp in post_new:
                 if os.path.isdir(fp):
@@ -211,7 +196,6 @@ class Transaction:
                     except OSError:
                         pass
 
-            # Synchronise tracking state back to the savepoint snapshot
             self._backups = {k: v for k, v in self._backups.items() if k in sp._backups}
             self._new_paths = set(sp._new_paths)
             self._dirs = set(sp._dirs)
@@ -222,8 +206,6 @@ class Transaction:
 
             if self._journal and self._temp_dir:
                 self._write_journal()
-
-    # ── rollback ──────────────────────────────────────────────────────────────
 
     def _rollback(self) -> None:
         errors: List[Exception] = []
@@ -267,8 +249,6 @@ class Transaction:
         if self._temp_dir and os.path.isdir(self._temp_dir):
             shutil.rmtree(self._temp_dir)
 
-
-# ── async wrapper ─────────────────────────────────────────────────────────────
 
 class AsyncTransaction:
     def __init__(self, *filepaths: str, **kwargs: Any) -> None:
