@@ -7,6 +7,38 @@ from abc import ABC, abstractmethod
 from ._exceptions import BackupError, RestoreError, StrategyError
 
 
+def _safe_replace(src: str, dest: str) -> None:
+    """
+    Move src → dest atomically where possible.
+
+    os.replace() can fail on Windows with WinError 5 (Access Denied) when the
+    source and destination live under different directory security descriptors
+    (e.g. %TEMP% → project dir) even though both are on the same drive.  It
+    also fails with errno.EXDEV on any OS when the paths cross filesystem
+    boundaries.  In both cases we fall back to copy-then-delete, which works
+    everywhere at the cost of atomicity.
+    """
+    try:
+        os.replace(src, dest)
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        needs_fallback = (
+            exc.errno in (errno.EXDEV, errno.EACCES, errno.EPERM)
+            or winerror == 5   # ERROR_ACCESS_DENIED
+            or winerror == 17  # ERROR_NOT_SAME_DEVICE (Windows EXDEV equivalent)
+        )
+        if not needs_fallback:
+            raise
+        try:
+            shutil.copy2(src, dest)
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+        except OSError:
+            raise exc
+
+
 class BackupStrategy(ABC):
     @abstractmethod
     def backup(self, src: str, dest: str) -> None: ...
@@ -65,17 +97,10 @@ class CopyStrategy(BackupStrategy):
 
     def restore(self, backup: str, original: str) -> None:
         try:
-            os.replace(backup, original)
+            _safe_replace(backup, original)
         except OSError as exc:
-            if exc.errno == errno.EXDEV:
-                # backup and original are on different filesystems
-                try:
-                    shutil.copy2(backup, original)
-                    os.remove(backup)
-                except OSError as exc2:
-                    raise RestoreError(original, str(exc2)) from exc2
-            else:
-                raise RestoreError(original, str(exc)) from exc
+            raise RestoreError(original, str(exc)) from exc
+
 
     def backup_dir(self, src: str, dest: str) -> None:
         try:
@@ -189,10 +214,12 @@ class HardlinkStrategy(BackupStrategy):
                     try:
                         orig_ino = os.stat(original).st_ino
                         bak_ino = os.stat(backup).st_ino
-                        if orig_ino != bak_ino:
+                        # Guard: st_ino returns 0 on some Windows filesystems
+                        # when inode information is unavailable — skip fast path.
+                        if orig_ino and bak_ino and orig_ino != bak_ino:
                             # File was atomically replaced: the hardlink still
-                            # holds the original inode — restore is a free rename.
-                            os.replace(backup, original)
+                            # holds the original inode — restore with safe rename.
+                            _safe_replace(backup, original)
                             try:
                                 os.remove(shadow)
                             except OSError:
@@ -200,15 +227,16 @@ class HardlinkStrategy(BackupStrategy):
                             return
                     except OSError:
                         pass
-                # In-place write (same inode) or original is gone: use shadow.
-                os.replace(shadow, original)
+                # In-place write (same inode), unknown inode, or original gone:
+                # use the shadow copy which always holds the original content.
+                _safe_replace(shadow, original)
                 try:
                     os.remove(backup)
                 except OSError:
                     pass
             else:
-                # Cross-device fallback: backup is a plain copy.
-                self._replace_with_exdev_fallback(backup, original)
+                # Cross-device / no-hardlink fallback: backup is a plain copy.
+                _safe_replace(backup, original)
         except OSError as exc:
             raise RestoreError(original, str(exc)) from exc
 
