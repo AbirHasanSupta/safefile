@@ -148,7 +148,7 @@ After rollback, verify the restored file matches the original backup's SHA-256. 
 ```python
 with transaction("critical.db", verify=True):
     rewrite_database("critical.db")
-# on rollback: raises RuntimeError if restored file doesn't match original checksum
+# on rollback: raises ChecksumMismatchError if restored file doesn't match original checksum
 ```
 
 ---
@@ -205,7 +205,7 @@ with transaction("tmp.txt", journal=False):
 
 ## Resilient rollback
 
-If restoring one file fails during rollback (e.g. a permission error or full disk), safefile continues restoring all remaining files and then raises a single `RuntimeError` summarising every failure. No file is silently skipped.
+If restoring one file fails during rollback (e.g. a permission error or full disk), safefile continues restoring all remaining files and then raises a single `RollbackError` summarising every failure. No file is silently skipped.
 
 ---
 
@@ -307,6 +307,38 @@ If the plugin fixtures are not auto-discovered (e.g. the package is not installe
 
 ```python
 from safefile._pytest_plugin import safefile_guard, safefile_guard_hardlink, safefile_guard_verify
+```
+
+---
+
+## Exceptions
+
+All exceptions inherit from `SafefileError` so you can catch everything with one clause.
+
+| Exception | Raised when |
+|---|---|
+| `SafefileError` | Base class for all safefile errors |
+| `BackupError` | A file/directory backup fails at entry |
+| `RestoreError` | A single file restore fails during rollback |
+| `RollbackError` | Rollback completes but one or more restores failed — `.errors` holds each `RestoreError` |
+| `ChecksumMismatchError` | `verify=True` and the restored file's SHA-256 doesn't match the original backup |
+| `JournalError` | Reading or writing the crash-recovery journal fails |
+| `StrategyError` | An unknown strategy name is passed to `transaction()` |
+
+```python
+from safefile import transaction
+from safefile import SafefileError, RollbackError, ChecksumMismatchError
+
+try:
+    with transaction("critical.db", verify=True):
+        rewrite_database("critical.db")
+except ChecksumMismatchError as e:
+    print(f"Checksum mismatch on {e.path}: expected {e.expected}, got {e.got}")
+except RollbackError as e:
+    for err in e.errors:
+        print(f"Restore failed: {err}")
+except SafefileError as e:
+    print(f"safefile error: {e}")
 ```
 
 ---
