@@ -6,6 +6,7 @@ import os
 from ._journal import recover_orphaned, find_orphaned_journals
 from ._transaction import Transaction
 from ._strategies import _STRATEGIES
+from ._exceptions import SafefileError
 
 
 def _fmt_bytes(n: int) -> str:
@@ -14,6 +15,15 @@ def _fmt_bytes(n: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def _make_progress_cb(label: str):
+    def _cb(pct: int) -> None:
+        sys.stderr.write(f"\r  backing up {label}: {pct:3d}%")
+        if pct >= 100:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+    return _cb
 
 
 def cmd_run(args) -> int:
@@ -30,27 +40,21 @@ def cmd_run(args) -> int:
     verify   = args.verify
     journal  = not args.no_journal
 
-    progress_files = set(filepaths) if args.progress else set()
-
-    def make_progress(path):
-        label = os.path.basename(path)
-        def _cb(pct):
-            sys.stderr.write(f"\r  backing up {label}: {pct:3d}%")
-            if pct >= 100:
-                sys.stderr.write("\n")
-            sys.stderr.flush()
-        return _cb
-
-    # one transaction per file so we can show individual progress bars
-    on_progress = None
-    if progress_files:
-        # single combined progress when only one file; multi handled below
-        if len(filepaths) == 1:
-            on_progress = make_progress(filepaths[0])
-
     if args.verbose:
         print(f"[safefile] protecting: {', '.join(filepaths)}")
         print(f"[safefile] strategy: {strategy}  verify: {verify}  journal: {journal}")
+
+    # Build per-file transactions when --progress is requested for multiple
+    # files so each file gets its own progress bar.  For a single file (or
+    # when --progress is not set) use a single combined transaction.
+    if args.progress and len(filepaths) > 1:
+        return _run_multi_progress(
+            filepaths, args.command, strategy, verify, journal, args.verbose
+        )
+
+    on_progress = None
+    if args.progress and len(filepaths) == 1:
+        on_progress = _make_progress_cb(os.path.basename(filepaths[0]))
 
     tx = Transaction(
         *filepaths,
@@ -58,8 +62,8 @@ def cmd_run(args) -> int:
         verify=verify,
         journal=journal,
         on_progress=on_progress,
-        on_commit=lambda: print("[safefile] committed") if args.verbose else None,
-        on_rollback=lambda: print("[safefile] rolled back — files restored") if args.verbose else None,
+        on_commit=(lambda: print("[safefile] committed")) if args.verbose else None,
+        on_rollback=(lambda: print("[safefile] rolled back — files restored")) if args.verbose else None,
     )
 
     result = None
@@ -70,6 +74,91 @@ def cmd_run(args) -> int:
                 raise subprocess.CalledProcessError(result.returncode, args.command)
     except subprocess.CalledProcessError:
         pass
+    except SafefileError as exc:
+        print(f"[safefile] error: {exc}", file=sys.stderr)
+        return 1
+
+    return result.returncode if result is not None else 1
+
+
+def _run_multi_progress(filepaths, command, strategy, verify, journal, verbose) -> int:
+    """
+    Back up each file individually with its own progress bar, then run the
+    command inside a single combined transaction that reuses those backups.
+
+    Strategy: use one Transaction for all files; the on_progress callback
+    tracks which file is currently being backed up by hooking _register.
+    We accomplish this by backing up sequentially and printing progress per
+    file before the command runs.
+    """
+    # We create one transaction but monkey-patch on_progress per file by
+    # using individual single-file transactions for backup, then combine
+    # into one outer transaction that shares the same temp dir.
+    #
+    # Simplest correct approach: run each file through its own Transaction
+    # for the backup phase only, collect their temp dirs, then restore all
+    # on failure.  This is clean and avoids coupling to internals.
+    import tempfile
+    import shutil
+    from ._strategies import get_strategy
+    from ._journal import write_journal, mark_committed
+
+    # One combined transaction — progress per-file via pre-registration
+    transactions = []
+    for fp in filepaths:
+        cb = _make_progress_cb(os.path.basename(fp))
+        t = Transaction(
+            fp,
+            strategy=strategy,
+            verify=verify,
+            journal=journal,
+            on_progress=cb,
+        )
+        transactions.append(t)
+
+    # Enter all transactions (backs up each file with its progress bar)
+    entered = []
+    try:
+        for t in transactions:
+            t.__enter__()
+            entered.append(t)
+    except Exception as exc:
+        print(f"[safefile] backup failed: {exc}", file=sys.stderr)
+        for t in reversed(entered):
+            try:
+                t.__exit__(Exception, exc, None)
+            except Exception:
+                pass
+        return 1
+
+    if verbose:
+        print("[safefile] all backups complete — running command")
+
+    result = None
+    failed = False
+    try:
+        result = subprocess.run(command)
+        if result.returncode != 0:
+            failed = True
+    except Exception:
+        failed = True
+
+    if failed:
+        if verbose:
+            print("[safefile] command failed — rolling back all files")
+        for t in reversed(entered):
+            try:
+                t.__exit__(Exception, Exception("nonzero exit"), None)
+            except SafefileError as exc:
+                print(f"[safefile] rollback error: {exc}", file=sys.stderr)
+    else:
+        if verbose:
+            print("[safefile] committed")
+        for t in entered:
+            try:
+                t.__exit__(None, None, None)
+            except SafefileError as exc:
+                print(f"[safefile] commit error: {exc}", file=sys.stderr)
 
     return result.returncode if result is not None else 1
 
@@ -112,7 +201,7 @@ def cmd_status(args) -> int:
     for o in orphans:
         files = list(o.get("backups", {}).keys())
         print(f"  [{o['temp_dir']}]  files: {', '.join(files) or '(none)'}")
-    return 1  # non-zero so CI/scripts can detect
+    return 1
 
 
 def main(argv=None) -> int:
@@ -171,20 +260,9 @@ def main(argv=None) -> int:
         "recover",
         help="Restore files from orphaned crash-recovery journals.",
     )
-    p_rec.add_argument(
-        "--yes", "-y",
-        action="store_true",
-        help="Skip confirmation prompt",
-    )
-    p_rec.add_argument(
-        "--dry-run", "-n",
-        action="store_true",
-        help="Show what would be recovered without doing it",
-    )
-    p_rec.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-    )
+    p_rec.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+    p_rec.add_argument("--dry-run", "-n", action="store_true", help="Show what would be recovered without doing it")
+    p_rec.add_argument("--verbose", "-v", action="store_true")
 
     # ── safefile status ───────────────────────────────────────────────────────
     sub.add_parser(
@@ -195,7 +273,6 @@ def main(argv=None) -> int:
     parsed = parser.parse_args(argv)
 
     if parsed.subcommand == "run":
-        # strip leading "--" separator if present
         cmd = parsed.command
         if cmd and cmd[0] == "--":
             cmd = cmd[1:]

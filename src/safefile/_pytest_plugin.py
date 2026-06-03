@@ -1,26 +1,10 @@
-"""
-pytest-safefile: auto-restore protected files after every test.
-
-Usage (conftest.py or inline):
-
-    import pytest
-
-    @pytest.fixture
-    def tx(safefile_fixture):
-        safefile_fixture.protect("config.yaml", "data.csv")
-
-Or use safefile_guard directly as a fixture argument:
-
-    def test_something(safefile_guard):
-        safefile_guard("config.yaml", "state.db")
-        mutate_config()
-        mutate_state()
-        # both files restored automatically after the test, pass or fail
-"""
 from __future__ import annotations
+
 from typing import Optional
 import pytest
+
 from ._transaction import Transaction
+from ._exceptions import SafefileError
 
 
 class SafefileGuard:
@@ -28,6 +12,9 @@ class SafefileGuard:
     Holds one Transaction per test. Call .protect(*paths) at any point
     inside the test — even mid-test — to add files to protection.
     Everything is rolled back unconditionally at teardown.
+
+    The guard uses Transaction.__enter__ / __exit__ correctly so all
+    Transaction invariants (journal, locks, hooks) are honoured.
     """
 
     def __init__(self, strategy: str = "copy", verify: bool = False) -> None:
@@ -39,8 +26,8 @@ class SafefileGuard:
     def protect(self, *paths: str) -> None:
         if not self._active:
             raise RuntimeError(
-                "safefile_guard.protect() called outside of a test. "
-                "Make sure safefile_guard is used as a pytest fixture."
+                "safefile_guard.protect() called outside of an active test. "
+                "Ensure safefile_guard is used as a pytest fixture argument."
             )
         for p in paths:
             self._tx._register(p)
@@ -49,25 +36,27 @@ class SafefileGuard:
         self._tx = Transaction(
             strategy=self._strategy,
             verify=self._verify,
-            journal=False,          # test-scoped; no need for crash recovery
+            journal=False,  # test-scoped; crash recovery not needed
         )
-        import tempfile, os
-        self._tx._temp_dir = tempfile.mkdtemp(prefix="safefile_pytest_")
+        # Use the real __enter__ so temp_dir is created via mkdtemp and
+        # all Transaction setup code runs exactly once, the normal way.
+        self._tx.__enter__()
         self._active = True
 
     def _stop(self) -> None:
         self._active = False
         if self._tx is not None:
-            self._tx._rollback()
+            # Simulate a failed block so __exit__ triggers rollback.
+            # We suppress any RollbackError so teardown never masks a test failure.
+            try:
+                self._tx.__exit__(Exception, Exception("safefile teardown"), None)
+            except SafefileError:
+                pass
             self._tx = None
 
 
 @pytest.fixture
 def safefile_guard():
-    """
-    Fixture that gives the test a SafefileGuard.
-    Call guard.protect(*paths) to snapshot files; they auto-restore after.
-    """
     guard = SafefileGuard()
     guard._start()
     yield guard
@@ -76,7 +65,6 @@ def safefile_guard():
 
 @pytest.fixture
 def safefile_guard_hardlink():
-    """Same as safefile_guard but uses hardlink strategy for large files."""
     guard = SafefileGuard(strategy="hardlink")
     guard._start()
     yield guard
@@ -85,7 +73,6 @@ def safefile_guard_hardlink():
 
 @pytest.fixture
 def safefile_guard_verify():
-    """Same as safefile_guard with checksum verification on restore."""
     guard = SafefileGuard(verify=True)
     guard._start()
     yield guard

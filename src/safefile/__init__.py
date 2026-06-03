@@ -5,8 +5,17 @@ from ._lazy import LazyWatcher
 from ._dryrun import DryRunProxy
 from ._journal import recover_orphaned, find_orphaned_journals
 from ._pytest_plugin import SafefileGuard
+from ._exceptions import (
+    SafefileError,
+    BackupError,
+    RestoreError,
+    RollbackError,
+    ChecksumMismatchError,
+    JournalError,
+    StrategyError,
+)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = [
     "transaction",
     "async_transaction",
@@ -21,6 +30,14 @@ __all__ = [
     "get_strategy",
     "CopyStrategy",
     "HardlinkStrategy",
+    # exceptions
+    "SafefileError",
+    "BackupError",
+    "RestoreError",
+    "RollbackError",
+    "ChecksumMismatchError",
+    "JournalError",
+    "StrategyError",
 ]
 
 

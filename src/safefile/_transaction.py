@@ -3,6 +3,7 @@ import hashlib
 import os
 import shutil
 import tempfile
+import threading
 from typing import Callable, Dict, List, Optional, Set, Union
 
 from ._strategies import BackupStrategy, get_strategy
@@ -10,6 +11,12 @@ from ._savepoint import Savepoint
 from ._lazy import LazyWatcher
 from ._dryrun import DryRunProxy
 from ._journal import write_journal, mark_committed
+from ._exceptions import (
+    BackupError,
+    ChecksumMismatchError,
+    RestoreError,
+    RollbackError,
+)
 
 
 def _sha256(path: str) -> str:
@@ -53,6 +60,8 @@ class Transaction:
         self._savepoints: List[Savepoint] = []
         self._sp_counter: int = 0
         self._dry_proxy: Optional[DryRunProxy] = None
+        # thread safety: all mutations to shared state go through this lock
+        self._lock = threading.RLock()
 
     # ── enter ─────────────────────────────────────────────────────────────────
 
@@ -75,29 +84,29 @@ class Transaction:
         return self
 
     def _register(self, fp: str) -> None:
-        if fp in self._backups or fp in self._new_paths:
-            return
-        if os.path.isdir(fp):
-            self._dirs.add(fp)
-            backup_path = os.path.join(
-                self._temp_dir, os.path.basename(fp.rstrip(os.sep)) + ".dirbak"
-            )
-            self._strategy.backup_dir(fp, backup_path)
-            self._backups[fp] = backup_path
-        elif os.path.exists(fp):
-            backup_path = os.path.join(
-                self._temp_dir, os.path.basename(fp) + ".bak"
-            )
-            self._strategy.backup(fp, backup_path)
-            if self._verify:
-                self._checksums[fp] = _sha256(fp)
-            self._backups[fp] = backup_path
-        else:
-            self._new_paths.add(fp)
+        with self._lock:
+            if fp in self._backups or fp in self._new_paths:
+                return
+            if os.path.isdir(fp):
+                self._dirs.add(fp)
+                backup_path = os.path.join(
+                    self._temp_dir, os.path.basename(fp.rstrip(os.sep)) + ".dirbak"
+                )
+                self._strategy.backup_dir(fp, backup_path)
+                self._backups[fp] = backup_path
+            elif os.path.exists(fp):
+                backup_path = os.path.join(
+                    self._temp_dir, os.path.basename(fp) + ".bak"
+                )
+                self._strategy.backup(fp, backup_path)
+                if self._verify:
+                    self._checksums[fp] = _sha256(fp)
+                self._backups[fp] = backup_path
+            else:
+                self._new_paths.add(fp)
 
-        # re-write journal whenever registration state changes
-        if self._journal and self._temp_dir and not self._dry_run:
-            self._write_journal()
+            if self._journal and self._temp_dir and not self._dry_run:
+                self._write_journal()
 
     def _write_journal(self) -> None:
         write_journal(
@@ -117,9 +126,10 @@ class Transaction:
                 self._dry_proxy.cleanup()
             return False
 
-        for sp in self._savepoints:
-            sp.discard()
-        self._savepoints.clear()
+        with self._lock:
+            for sp in self._savepoints:
+                sp.discard()
+            self._savepoints.clear()
 
         if exc_type is None:
             if self._journal and self._temp_dir:
@@ -136,46 +146,102 @@ class Transaction:
     # ── savepoints ────────────────────────────────────────────────────────────
 
     def savepoint(self) -> Savepoint:
-        sp = Savepoint(
-            self._strategy,
-            self._backups,
-            self._dirs,
-            self._new_paths,
-            self._sp_counter,
-        )
-        self._sp_counter += 1
-        self._savepoints.append(sp)
-        return sp
+        with self._lock:
+            sp = Savepoint(
+                self._strategy,
+                self._backups,
+                self._dirs,
+                self._new_paths,
+                self._sp_counter,
+            )
+            self._sp_counter += 1
+            self._savepoints.append(sp)
+            return sp
 
     def rollback_to(self, sp: Savepoint) -> None:
-        idx = self._savepoints.index(sp)
-        for later_sp in self._savepoints[idx + 1:]:
-            later_sp.discard()
-        self._savepoints = self._savepoints[:idx]
-        sp.restore()
+        with self._lock:
+            idx = self._savepoints.index(sp)
+            for later_sp in self._savepoints[idx + 1:]:
+                later_sp.discard()
+            self._savepoints = self._savepoints[:idx]
+
+            sp.restore()
+
+            # Undo registrations that happened AFTER this savepoint was taken.
+            #
+            # Case A – files backed up post-savepoint (existed at _register time
+            #          but were unknown at savepoint time): delete from disk and
+            #          discard the orphan backup sitting in our temp dir.
+            post_backed = set(self._backups.keys()) - set(sp._backups.keys())
+            for fp in post_backed:
+                backup_path = self._backups.get(fp)
+                if backup_path:
+                    try:
+                        if os.path.isdir(backup_path):
+                            shutil.rmtree(backup_path, ignore_errors=True)
+                        elif os.path.exists(backup_path):
+                            os.remove(backup_path)
+                    except OSError:
+                        pass
+                if os.path.isdir(fp):
+                    shutil.rmtree(fp, ignore_errors=True)
+                elif os.path.exists(fp):
+                    try:
+                        os.remove(fp)
+                    except OSError:
+                        pass
+
+            # Case B – paths registered as new (didn't exist) post-savepoint:
+            #          delete if they were subsequently created on disk.
+            post_new = self._new_paths - sp._new_paths
+            for fp in post_new:
+                if os.path.isdir(fp):
+                    shutil.rmtree(fp, ignore_errors=True)
+                elif os.path.exists(fp):
+                    try:
+                        os.remove(fp)
+                    except OSError:
+                        pass
+
+            # Synchronise tracking state back to the savepoint snapshot
+            self._backups = {k: v for k, v in self._backups.items() if k in sp._backups}
+            self._new_paths = set(sp._new_paths)
+            self._dirs = set(sp._dirs)
+            if self._verify:
+                self._checksums = {
+                    k: v for k, v in self._checksums.items() if k in sp._backups
+                }
+
+            if self._journal and self._temp_dir:
+                self._write_journal()
 
     # ── rollback ──────────────────────────────────────────────────────────────
 
     def _rollback(self) -> None:
         errors = []
-        for original, backup in self._backups.items():
+        with self._lock:
+            backups_snapshot = dict(self._backups)
+            new_paths_snapshot = set(self._new_paths)
+            dirs_snapshot = set(self._dirs)
+            checksums_snapshot = dict(self._checksums)
+
+        for original, backup in backups_snapshot.items():
             try:
-                if original in self._dirs:
+                if original in dirs_snapshot:
                     self._strategy.restore_dir(backup, original)
                 else:
                     self._strategy.restore(backup, original)
-                    if self._verify and original in self._checksums:
+                    if self._verify and original in checksums_snapshot:
                         restored = _sha256(original)
-                        expected = self._checksums[original]
+                        expected = checksums_snapshot[original]
                         if restored != expected:
-                            raise RuntimeError(
-                                f"Checksum mismatch after restoring '{original}': "
-                                f"expected {expected}, got {restored}"
+                            errors.append(
+                                ChecksumMismatchError(original, expected, restored)
                             )
-            except Exception as e:
+            except (RestoreError, Exception) as e:
                 errors.append(e)
 
-        for fp in self._new_paths:
+        for fp in new_paths_snapshot:
             try:
                 if os.path.isdir(fp):
                     shutil.rmtree(fp, ignore_errors=True)
@@ -187,10 +253,7 @@ class Transaction:
         self._cleanup_temp()
 
         if errors:
-            raise RuntimeError(
-                f"Rollback completed with {len(errors)} error(s): "
-                + "; ".join(str(e) for e in errors)
-            )
+            raise RollbackError(errors)
 
     def _cleanup_temp(self) -> None:
         if self._temp_dir and os.path.isdir(self._temp_dir):
@@ -204,11 +267,11 @@ class AsyncTransaction:
         self._tx = Transaction(*filepaths, **kwargs)
 
     async def __aenter__(self) -> Transaction:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._tx.__enter__)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None, lambda: self._tx.__exit__(exc_type, exc_val, exc_tb)
         )

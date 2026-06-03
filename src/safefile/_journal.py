@@ -2,7 +2,9 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
+
+from ._exceptions import JournalError
 
 
 _JOURNAL_FILENAME = "safefile_journal.json"
@@ -31,39 +33,41 @@ def write_journal(
     }
     path = _journal_path(temp_dir)
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=2)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except (OSError, AttributeError):
-            pass
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except (OSError, AttributeError):
+                pass
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise JournalError(path, str(exc)) from exc
 
 
 def mark_committed(temp_dir: str) -> None:
     path = _journal_path(temp_dir)
     if not os.path.exists(path):
         return
-    with open(path, encoding="utf-8") as f:
-        record = json.load(f)
-    record["status"] = "committed"
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=2)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except (OSError, AttributeError):
-            pass
-    os.replace(tmp, path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+        record["status"] = "committed"
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except (OSError, AttributeError):
+                pass
+        os.replace(tmp, path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise JournalError(path, str(exc)) from exc
 
 
 def find_orphaned_journals() -> List[Dict]:
-    """
-    Scan /tmp for safefile_ temp dirs that contain an open journal,
-    indicating the process was killed before commit or rollback.
-    """
     orphans = []
     tmp_root = tempfile.gettempdir()
     try:
@@ -88,14 +92,6 @@ def find_orphaned_journals() -> List[Dict]:
 
 
 def recover_orphaned(verbose: bool = False) -> int:
-    """
-    Detect and restore any files left mid-transaction by a crashed process.
-    Returns the number of transactions recovered.
-
-    Call this at application startup:
-        from safefile import recover_orphaned
-        recover_orphaned()
-    """
     from ._strategies import get_strategy
 
     orphans = find_orphaned_journals()
@@ -135,8 +131,8 @@ def recover_orphaned(verbose: bool = False) -> int:
                 shutil.rmtree(temp_dir)
 
             recovered += 1
-        except Exception as e:
+        except Exception as exc:
             if verbose:
-                print(f"  [safefile] recovery failed for {temp_dir}: {e}")
+                print(f"  [safefile] recovery failed for {temp_dir}: {exc}")
 
     return recovered

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "safefile"
-version = "1.0.0"
+version = "1.1.0"
 description = "Transactional file modifications – atomic, rollback on failure"
 readme = "README.md"
 license = {text = "MIT"}
@@ -13,20 +13,36 @@ authors = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Filesystems",
     "Framework :: Pytest",
+    "Typing :: Typed",
 ]
 requires-python = ">=3.7"
 dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "mypy>=1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/AbirHasanSupta/safefile"
 Repository = "https://github.com/AbirHasanSupta/safefile"
 "Issue Tracker" = "https://github.com/AbirHasanSupta/safefile/issues"
+Changelog = "https://github.com/AbirHasanSupta/safefile/blob/main/CHANGELOG.md"
 
 [project.scripts]
 safefile = "safefile._cli:main"
@@ -36,3 +52,15 @@ safefile = "safefile._pytest_plugin"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+safefile = ["py.typed", "*.pyi"]
+
+[tool.mypy]
+files = ["src/safefile"]
+strict = true
+python_version = "3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

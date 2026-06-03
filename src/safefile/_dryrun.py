@@ -1,7 +1,7 @@
 import os
 import shutil
 import tempfile
-from typing import Dict, Optional
+from typing import Dict
 
 
 class DryRunProxy:
@@ -9,6 +9,10 @@ class DryRunProxy:
     Returned from Transaction.__enter__ when dry_run=True.
     Intercepts writes by redirecting paths to shadow copies.
     The original files are never modified.
+
+    Exposes touch(), savepoint(), rollback_to() as no-ops so that
+    combining dry_run=True with lazy=True or savepoint calls does not
+    raise AttributeError.
 
     Usage:
         with transaction("prod.cfg", dry_run=True) as tx:
@@ -39,6 +43,28 @@ class DryRunProxy:
     def shadow_dir(self) -> str:
         return self._shadow_dir
 
+    # ── no-op compatibility shims ─────────────────────────────────────────────
+
+    def touch(self, *paths: str) -> None:
+        """No-op: dry_run mode never backs up, so touch is meaningless."""
+
+    def savepoint(self) -> "_DryRunSavepoint":
+        """Returns a no-op savepoint compatible object."""
+        return _DryRunSavepoint()
+
+    def rollback_to(self, sp: "_DryRunSavepoint") -> None:
+        """No-op: dry_run mode has no real state to roll back."""
+
     def cleanup(self) -> None:
         if os.path.isdir(self._shadow_dir):
             shutil.rmtree(self._shadow_dir)
+
+
+class _DryRunSavepoint:
+    """Placeholder returned by DryRunProxy.savepoint(). Does nothing."""
+
+    def restore(self) -> None:
+        pass
+
+    def discard(self) -> None:
+        pass

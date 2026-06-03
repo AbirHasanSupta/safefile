@@ -1,8 +1,25 @@
 import asyncio
+import json
 import os
 import shutil
+import tempfile
+import threading
+
 import pytest
-from safefile import transaction, async_transaction
+
+from safefile import transaction, async_transaction, recover_orphaned, find_orphaned_journals
+from safefile._exceptions import (
+    SafefileError,
+    BackupError,
+    RestoreError,
+    RollbackError,
+    ChecksumMismatchError,
+    JournalError,
+    StrategyError,
+)
+from safefile._journal import write_journal, mark_committed, _journal_path
+from safefile._pytest_plugin import SafefileGuard
+from safefile._cli import main
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -25,7 +42,7 @@ def rm(path):
         os.remove(path)
 
 
-# ── v0.2: copy strategy ───────────────────────────────────────────────────────
+# ── copy strategy ─────────────────────────────────────────────────────────────
 
 def test_commit_success():
     write("c_commit.txt", "original")
@@ -63,7 +80,7 @@ def test_multiple_files():
     rm("c_f1.txt"); rm("c_f2.txt")
 
 
-# ── v0.2: hardlink strategy ───────────────────────────────────────────────────
+# ── hardlink strategy ─────────────────────────────────────────────────────────
 
 def test_hardlink_commit():
     write("h_commit.txt", "original")
@@ -88,8 +105,72 @@ def test_hardlink_new_file_removed_on_rollback():
             raise RuntimeError
     assert not os.path.exists("h_new.txt")
 
+def test_hardlink_uses_fast_path_for_atomic_replace(tmp_path):
+    """
+    Phase-1: when a file is atomically replaced (new inode) the restore must
+    use the hardlink directly and the shadow copy must be cleaned up afterward.
+    """
+    f = str(tmp_path / "hl_atomic.txt")
+    write(f, "original")
+    inode_before = os.stat(f).st_ino
 
-# ── v0.2: directory support ───────────────────────────────────────────────────
+    with pytest.raises(ValueError):
+        with transaction(f, strategy="hardlink") as tx:
+            backup_dir = tx._temp_dir
+            tmp_f = f + ".new"
+            write(tmp_f, "atomically replaced")
+            os.replace(tmp_f, f)
+            assert os.stat(f).st_ino != inode_before
+            raise ValueError
+
+    assert read(f) == "original"
+    assert not os.path.isdir(backup_dir)
+
+def test_hardlink_uses_shadow_for_inplace_write(tmp_path):
+    """
+    Phase-1: when a file is written in-place (same inode) the restore must
+    fall back to the shadow copy to recover the original content.
+    """
+    f = str(tmp_path / "hl_inplace.txt")
+    write(f, "original")
+    inode_before = os.stat(f).st_ino
+
+    with pytest.raises(ValueError):
+        with transaction(f, strategy="hardlink"):
+            write(f, "changed in-place")
+            assert os.stat(f).st_ino == inode_before
+            raise ValueError
+
+    assert read(f) == "original"
+
+def test_hardlink_multiple_files_rollback(tmp_path):
+    fa = str(tmp_path / "hl_fa.txt")
+    fb = str(tmp_path / "hl_fb.txt")
+    write(fa, "fa-orig")
+    write(fb, "fb-orig")
+    with pytest.raises(ValueError):
+        with transaction(fa, fb, strategy="hardlink"):
+            write(fa, "fa-changed")
+            write(fb, "fb-changed")
+            raise ValueError
+    assert read(fa) == "fa-orig"
+    assert read(fb) == "fb-orig"
+
+def test_hardlink_binary_file_rollback(tmp_path):
+    f = str(tmp_path / "hl_bin.bin")
+    data = bytes(range(256))
+    with open(f, "wb") as fh:
+        fh.write(data)
+    with pytest.raises(RuntimeError):
+        with transaction(f, strategy="hardlink"):
+            with open(f, "wb") as fh:
+                fh.write(b"\xff" * 256)
+            raise RuntimeError
+    with open(f, "rb") as fh:
+        assert fh.read() == data
+
+
+# ── directory support ─────────────────────────────────────────────────────────
 
 def test_dir_commit():
     os.makedirs("d_commit_dir", exist_ok=True)
@@ -135,7 +216,7 @@ def test_dir_hardlink_rollback():
     rm("d_hl_dir")
 
 
-# ── v0.2: hooks ───────────────────────────────────────────────────────────────
+# ── hooks ─────────────────────────────────────────────────────────────────────
 
 def test_on_commit_hook_called():
     called = []
@@ -172,11 +253,11 @@ def test_on_rollback_not_called_on_success():
     rm("hook_nr.txt")
 
 def test_invalid_strategy_raises():
-    with pytest.raises(ValueError, match="Unknown strategy"):
+    with pytest.raises(StrategyError, match="Unknown strategy"):
         transaction("any.txt", strategy="magic")
 
 
-# ── v0.3: savepoints ─────────────────────────────────────────────────────────
+# ── savepoints ────────────────────────────────────────────────────────────────
 
 def test_savepoint_rollback_partial():
     write("sp_a.txt", "a-orig")
@@ -186,7 +267,6 @@ def test_savepoint_rollback_partial():
         sp = tx.savepoint()
         write("sp_b.txt", "b-step2")
         tx.rollback_to(sp)
-        # b should be back to orig, a stays at step1
         assert read("sp_a.txt") == "a-step1"
         assert read("sp_b.txt") == "b-orig"
         write("sp_b.txt", "b-final")
@@ -216,7 +296,6 @@ def test_multiple_savepoints_stack():
         sp2 = tx.savepoint()
         write("sp_m.txt", "v3")
         tx.rollback_to(sp1)
-        # rolling back to sp1 should discard sp2
         assert read("sp_m.txt") == "v1"
     assert read("sp_m.txt") == "v1"
     rm("sp_m.txt")
@@ -230,20 +309,41 @@ def test_savepoint_new_file_removed_on_rollback():
         assert not os.path.exists("sp_nf.txt")
     rm("sp_exist.txt")
 
+def test_savepoint_rollback_to_does_not_leave_stale_new_paths(tmp_path):
+    """
+    Phase-1 regression: after rollback_to removes a file, that path must be
+    removed from _new_paths so the outer rollback does not attempt a second
+    (failing) deletion.
+    """
+    f = str(tmp_path / "sp_stale.txt")
+    write(f, "original")
+    # No exception — just check no error on final __exit__
+    with transaction(f) as tx:
+        sp = tx.savepoint()
+        # create a brand-new file inside the savepoint scope
+        new_f = str(tmp_path / "sp_new.txt")
+        write(new_f, "new")
+        tx._register(new_f)
+        tx.rollback_to(sp)
+        # new_f should be gone now; it must not be in _new_paths still
+        assert not os.path.exists(new_f)
+        # confirm outer rollback won't choke on a missing path
+        assert new_f not in tx._new_paths
 
-# ── v0.3: lazy backup ─────────────────────────────────────────────────────────
+
+# ── lazy backup ───────────────────────────────────────────────────────────────
 
 def test_lazy_backup_only_touched_files():
     write("lz_a.txt", "a-orig")
     write("lz_b.txt", "b-orig")
     with pytest.raises(RuntimeError):
         with transaction("lz_a.txt", "lz_b.txt", lazy=True) as tx:
-            tx.touch("lz_a.txt")          # only a is backed up
+            tx.touch("lz_a.txt")
             write("lz_a.txt", "a-changed")
-            write("lz_b.txt", "b-changed")  # b changed but NOT touch()'d
+            write("lz_b.txt", "b-changed")
             raise RuntimeError
-    assert read("lz_a.txt") == "a-orig"   # a restored
-    assert read("lz_b.txt") == "b-changed"  # b not backed up, stays changed
+    assert read("lz_a.txt") == "a-orig"
+    assert read("lz_b.txt") == "b-changed"
     rm("lz_a.txt"); rm("lz_b.txt")
 
 def test_lazy_commit_unchanged():
@@ -260,12 +360,11 @@ def test_lazy_no_touch_no_backup():
         with transaction("lz_skip.txt", lazy=True) as tx:
             write("lz_skip.txt", "changed")
             raise RuntimeError
-    # never touch()'d → never backed up → not restored
     assert read("lz_skip.txt") == "changed"
     rm("lz_skip.txt")
 
 
-# ── v0.3: async ───────────────────────────────────────────────────────────────
+# ── async ─────────────────────────────────────────────────────────────────────
 
 def test_async_commit():
     async def run():
@@ -287,8 +386,19 @@ def test_async_rollback():
         rm("async_rb.txt")
     asyncio.run(run())
 
+def test_async_uses_get_running_loop():
+    """
+    Phase-1 regression: AsyncTransaction must use asyncio.get_running_loop(),
+    not the deprecated asyncio.get_event_loop().
+    """
+    import inspect
+    import safefile._transaction as mod
+    src = inspect.getsource(mod.AsyncTransaction)
+    assert "get_running_loop" in src
+    assert "get_event_loop" not in src
 
-# ── v0.4: dry run ─────────────────────────────────────────────────────────────
+
+# ── dry run ───────────────────────────────────────────────────────────────────
 
 def test_dry_run_does_not_modify_original():
     write("dry.txt", "original")
@@ -312,9 +422,7 @@ def test_dry_run_shadow_path_is_writable():
 
 def test_dry_run_shadow_cleaned_up_after_block():
     write("dry_clean.txt", "x")
-    shadow_path = None
     with transaction("dry_clean.txt", dry_run=True) as tx:
-        shadow_path = tx.path("dry_clean.txt")
         shadow_dir = tx.shadow_dir()
     assert not os.path.isdir(shadow_dir)
     rm("dry_clean.txt")
@@ -326,8 +434,33 @@ def test_dry_run_new_file_not_created():
             f.write("something")
     assert not os.path.exists("dry_new.txt")
 
+def test_dry_run_combined_with_lazy_no_attribute_error():
+    """
+    Phase-1 regression: dry_run=True + lazy=True must not raise AttributeError.
+    DryRunProxy exposes a no-op touch().
+    """
+    write("dry_lazy.txt", "original")
+    with transaction("dry_lazy.txt", dry_run=True, lazy=True) as tx:
+        tx.touch("dry_lazy.txt")  # must not raise AttributeError
+        with open(tx.path("dry_lazy.txt"), "w") as f:
+            f.write("shadow write")
+    assert read("dry_lazy.txt") == "original"
+    rm("dry_lazy.txt")
 
-# ── v0.4: checksum verify ─────────────────────────────────────────────────────
+def test_dry_run_savepoint_no_attribute_error():
+    """
+    Phase-1 regression: tx.savepoint() and tx.rollback_to() on a DryRunProxy
+    must not raise AttributeError.
+    """
+    write("dry_sp.txt", "original")
+    with transaction("dry_sp.txt", dry_run=True) as tx:
+        sp = tx.savepoint()
+        tx.rollback_to(sp)
+    assert read("dry_sp.txt") == "original"
+    rm("dry_sp.txt")
+
+
+# ── checksum verify ───────────────────────────────────────────────────────────
 
 def test_verify_passes_on_clean_restore():
     write("vf_ok.txt", "original")
@@ -346,17 +479,17 @@ def test_verify_no_error_on_commit():
     rm("vf_commit.txt")
 
 
-# ── v0.4: streaming / progress ────────────────────────────────────────────────
+# ── streaming / progress ──────────────────────────────────────────────────────
 
 def test_progress_callback_called_for_large_files(tmp_path):
     large = str(tmp_path / "large.bin")
     with open(large, "wb") as f:
-        f.write(b"x" * (6 * 1024 * 1024))  # 6 MB
+        f.write(b"x" * (6 * 1024 * 1024))
     progress = []
     with pytest.raises(RuntimeError):
         with transaction(
             large,
-            chunk_size=2 * 1024 * 1024,   # 2 MB chunks → 3 callbacks
+            chunk_size=2 * 1024 * 1024,
             on_progress=progress.append,
         ):
             with open(large, "w") as f:
@@ -382,13 +515,7 @@ def test_progress_not_called_for_small_files(tmp_path):
     rm(small)
 
 
-# ── v0.5: journal / crash recovery ───────────────────────────────────────────
-
-import json
-import tempfile
-from safefile import recover_orphaned, find_orphaned_journals
-from safefile._journal import write_journal, mark_committed, _journal_path
-
+# ── journal / crash recovery ──────────────────────────────────────────────────
 
 def test_journal_written_on_enter(tmp_path):
     f = str(tmp_path / "jrn.txt")
@@ -401,7 +528,6 @@ def test_journal_written_on_enter(tmp_path):
         assert rec["status"] == "open"
         assert f in rec["backups"]
 
-
 def test_journal_marked_committed_on_success(tmp_path):
     f = str(tmp_path / "jrn_c.txt")
     write(f, "original")
@@ -409,9 +535,7 @@ def test_journal_marked_committed_on_success(tmp_path):
     with transaction(f, journal=True) as tx:
         captured_dir.append(tx._temp_dir)
         write(f, "modified")
-    # temp_dir is deleted on commit — journal is gone
     assert not os.path.isdir(captured_dir[0])
-
 
 def test_journal_absent_when_disabled(tmp_path):
     f = str(tmp_path / "nojrn.txt")
@@ -421,21 +545,13 @@ def test_journal_absent_when_disabled(tmp_path):
         journal_file = _journal_path(td)
         assert not os.path.exists(journal_file)
 
-
 def test_recover_orphaned_restores_files(tmp_path):
     f = str(tmp_path / "orphan.txt")
     write(f, "original")
-
-    # Manually simulate a crashed transaction:
-    # 1. create temp dir + backup as the real Transaction would
     td = tempfile.mkdtemp(prefix="safefile_")
     backup = os.path.join(td, "orphan.txt.bak")
     shutil.copy2(f, backup)
-
-    # 2. overwrite the original (simulating mid-transaction crash)
     write(f, "corrupted")
-
-    # 3. write an open journal
     write_journal(
         temp_dir=td,
         filepaths=[f],
@@ -444,18 +560,14 @@ def test_recover_orphaned_restores_files(tmp_path):
         dirs=set(),
         strategy="copy",
     )
-
-    # 4. recover
     count = recover_orphaned()
     assert count >= 1
     assert read(f) == "original"
     assert not os.path.isdir(td)
 
-
 def test_recover_orphaned_removes_new_files(tmp_path):
     new_f = str(tmp_path / "new_orphan.txt")
     write(new_f, "created mid-transaction")
-
     td = tempfile.mkdtemp(prefix="safefile_")
     write_journal(
         temp_dir=td,
@@ -465,17 +577,14 @@ def test_recover_orphaned_removes_new_files(tmp_path):
         dirs=set(),
         strategy="copy",
     )
-
     count = recover_orphaned()
     assert count >= 1
     assert not os.path.exists(new_f)
     assert not os.path.isdir(td)
 
-
 def test_recover_orphaned_ignores_committed(tmp_path):
     f = str(tmp_path / "committed.txt")
     write(f, "final")
-
     td = tempfile.mkdtemp(prefix="safefile_")
     backup = os.path.join(td, "committed.txt.bak")
     shutil.copy2(f, backup)
@@ -488,13 +597,9 @@ def test_recover_orphaned_ignores_committed(tmp_path):
         strategy="copy",
     )
     mark_committed(td)
-
-    count = recover_orphaned()
-    # committed journal must NOT be recovered (status != "open")
+    recover_orphaned()
     assert read(f) == "final"
-    # clean up manually since recover won't touch committed journals
     shutil.rmtree(td, ignore_errors=True)
-
 
 def test_find_orphaned_journals_returns_open_only(tmp_path):
     td = tempfile.mkdtemp(prefix="safefile_")
@@ -510,7 +615,6 @@ def test_find_orphaned_journals_returns_open_only(tmp_path):
     assert any(o["temp_dir"] == td for o in orphans)
     shutil.rmtree(td, ignore_errors=True)
 
-
 def test_journal_disabled_does_not_affect_rollback(tmp_path):
     f = str(tmp_path / "nj.txt")
     write(f, "original")
@@ -521,13 +625,9 @@ def test_journal_disabled_does_not_affect_rollback(tmp_path):
     assert read(f) == "original"
 
 
-# ── v0.5: resilient rollback — partial failure isolation ─────────────────────
+# ── resilient rollback ────────────────────────────────────────────────────────
 
 def test_rollback_continues_after_single_file_restore_error(tmp_path, monkeypatch):
-    """
-    Even if restoring one file raises (e.g. permission error), the rest
-    of the files should still be restored.
-    """
     fa = str(tmp_path / "ra.txt")
     fb = str(tmp_path / "rb.txt")
     write(fa, "a-orig")
@@ -545,34 +645,41 @@ def test_rollback_continues_after_single_file_restore_error(tmp_path, monkeypatc
             raise OSError("simulated disk error on first restore")
         original_restore(self, backup, original)
 
-    monkeypatch.setattr(
-        "safefile._strategies.CopyStrategy.restore", flaky_restore
-    )
+    monkeypatch.setattr("safefile._strategies.CopyStrategy.restore", flaky_restore)
 
-    with pytest.raises((ValueError, RuntimeError)):
+    with pytest.raises((ValueError, RollbackError)):
         with transaction(fa, fb):
             write(fa, "a-changed")
             write(fb, "b-changed")
             raise ValueError
 
-    # at least fb must be restored
     assert read(fb) == "b-orig"
 
+def test_rollback_error_is_safefile_error(tmp_path, monkeypatch):
+    """RollbackError must be a subclass of SafefileError."""
+    f = str(tmp_path / "re.txt")
+    write(f, "orig")
 
-# ── v0.5: atomic streaming — .part file never left behind ────────────────────
+    def always_fail(self, backup, original):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("safefile._strategies.CopyStrategy.restore", always_fail)
+
+    with pytest.raises(SafefileError):
+        with transaction(f):
+            write(f, "changed")
+            raise ValueError
+
+
+# ── atomic streaming ──────────────────────────────────────────────────────────
 
 def test_partial_backup_cleaned_up_on_interrupted_stream(tmp_path, monkeypatch):
     large = str(tmp_path / "large.bin")
     with open(large, "wb") as f:
         f.write(b"x" * (4 * 1024 * 1024))
 
-    original_chunked = __import__(
-        "safefile._strategies", fromlist=["CopyStrategy"]
-    ).CopyStrategy._chunked_copy
-
     def crash_mid_stream(self, src, dest, size):
         part = dest + ".part"
-        # write a partial .part then simulate crash
         with open(part, "wb") as f:
             f.write(b"partial")
         raise IOError("simulated mid-stream failure")
@@ -581,7 +688,7 @@ def test_partial_backup_cleaned_up_on_interrupted_stream(tmp_path, monkeypatch):
         "safefile._strategies.CopyStrategy._chunked_copy", crash_mid_stream
     )
 
-    with pytest.raises((IOError, RuntimeError)):
+    with pytest.raises((IOError, RuntimeError, BackupError)):
         with transaction(
             large,
             chunk_size=1 * 1024 * 1024,
@@ -589,15 +696,84 @@ def test_partial_backup_cleaned_up_on_interrupted_stream(tmp_path, monkeypatch):
         ):
             pass
 
-    # no .part orphan left
     for fname in os.listdir(tmp_path):
         assert not fname.endswith(".part"), f"orphaned .part file: {fname}"
 
 
-# ── v1.0: pytest plugin (safefile_guard fixture) ──────────────────────────────
+# ── exception hierarchy ───────────────────────────────────────────────────────
 
-from safefile._pytest_plugin import SafefileGuard
+def test_strategy_error_is_safefile_error():
+    with pytest.raises(SafefileError):
+        transaction("x.txt", strategy="nonexistent")
 
+def test_backup_error_attributes():
+    err = BackupError("/some/path", "disk full")
+    assert err.path == "/some/path"
+    assert err.reason == "disk full"
+    assert isinstance(err, SafefileError)
+
+def test_restore_error_attributes():
+    err = RestoreError("/some/path", "permission denied")
+    assert err.path == "/some/path"
+    assert err.reason == "permission denied"
+    assert isinstance(err, SafefileError)
+
+def test_rollback_error_attributes():
+    inner = OSError("boom")
+    err = RollbackError([inner])
+    assert err.errors == [inner]
+    assert isinstance(err, SafefileError)
+
+def test_checksum_mismatch_error_attributes():
+    err = ChecksumMismatchError("/f", "aaa", "bbb")
+    assert err.path == "/f"
+    assert err.expected == "aaa"
+    assert err.got == "bbb"
+    assert isinstance(err, SafefileError)
+
+def test_journal_error_attributes():
+    err = JournalError("/tmp/j.json", "invalid JSON")
+    assert err.journal_path == "/tmp/j.json"
+    assert isinstance(err, SafefileError)
+
+
+# ── thread safety ─────────────────────────────────────────────────────────────
+
+def test_concurrent_register_does_not_corrupt_state(tmp_path):
+    """
+    Phase-1: concurrent _register() calls from multiple threads must not
+    corrupt _backups or _new_paths.
+    """
+    files = [str(tmp_path / f"t{i}.txt") for i in range(20)]
+    for f in files:
+        write(f, f"content-{f}")
+
+    tx = transaction(*files, journal=False)
+    tx.__enter__()
+
+    errors = []
+    def register_all():
+        for f in files:
+            try:
+                tx._register(f)
+            except Exception as exc:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=register_all) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    # each file must appear exactly once in _backups
+    for f in files:
+        assert list(tx._backups.keys()).count(f) == 1
+
+    tx.__exit__(None, None, None)
+
+
+# ── pytest plugin ─────────────────────────────────────────────────────────────
 
 def test_guard_restores_file_after_test(tmp_path):
     f = str(tmp_path / "guarded.txt")
@@ -609,7 +785,6 @@ def test_guard_restores_file_after_test(tmp_path):
     guard._stop()
     assert read(f) == "original"
 
-
 def test_guard_removes_new_file_after_test(tmp_path):
     f = str(tmp_path / "new_guarded.txt")
     guard = SafefileGuard()
@@ -618,7 +793,6 @@ def test_guard_removes_new_file_after_test(tmp_path):
     write(f, "created mid-test")
     guard._stop()
     assert not os.path.exists(f)
-
 
 def test_guard_multiple_files(tmp_path):
     fa = str(tmp_path / "ga.txt")
@@ -634,7 +808,6 @@ def test_guard_multiple_files(tmp_path):
     assert read(fa) == "a-orig"
     assert read(fb) == "b-orig"
 
-
 def test_guard_protect_mid_test(tmp_path):
     fa = str(tmp_path / "mid_a.txt")
     fb = str(tmp_path / "mid_b.txt")
@@ -644,13 +817,11 @@ def test_guard_protect_mid_test(tmp_path):
     guard._start()
     guard.protect(fa)
     write(fa, "a-changed")
-    # protect fb mid-test
     guard.protect(fb)
     write(fb, "b-changed")
     guard._stop()
     assert read(fa) == "a-orig"
     assert read(fb) == "b-orig"
-
 
 def test_guard_hardlink_strategy(tmp_path):
     f = str(tmp_path / "hl_guarded.txt")
@@ -662,7 +833,6 @@ def test_guard_hardlink_strategy(tmp_path):
     guard._stop()
     assert read(f) == "original"
 
-
 def test_guard_verify(tmp_path):
     f = str(tmp_path / "vf_guarded.txt")
     write(f, "original")
@@ -672,7 +842,6 @@ def test_guard_verify(tmp_path):
     write(f, "mutated")
     guard._stop()
     assert read(f) == "original"
-
 
 def test_guard_directory(tmp_path):
     d = str(tmp_path / "guarded_dir")
@@ -687,8 +856,20 @@ def test_guard_directory(tmp_path):
     assert read(os.path.join(d, "a.txt")) == "original"
     assert not os.path.exists(os.path.join(d, "b.txt"))
 
+def test_guard_protect_outside_test_raises():
+    guard = SafefileGuard()
+    with pytest.raises(RuntimeError, match="outside of an active test"):
+        guard.protect("any.txt")
 
-# ── v1.0: pytest fixture integration test ─────────────────────────────────────
+def test_guard_uses_transaction_enter_exit(tmp_path):
+    """
+    Phase-1 regression: SafefileGuard must call Transaction.__enter__ in
+    _start(), not bypass it by setting _temp_dir manually.
+    """
+    import safefile._pytest_plugin as plugin_mod
+    import inspect
+    src = inspect.getsource(plugin_mod.SafefileGuard._start)
+    assert "__enter__" in src
 
 def test_safefile_guard_fixture(safefile_guard, tmp_path):
     f = str(tmp_path / "fixture_test.txt")
@@ -696,76 +877,59 @@ def test_safefile_guard_fixture(safefile_guard, tmp_path):
     safefile_guard.protect(f)
     write(f, "modified by test")
     assert read(f) == "modified by test"
-    # teardown restores automatically — verified in next test
-
 
 def test_safefile_guard_fixture_restored_independently(tmp_path):
-    # this test does NOT use safefile_guard, proving the previous test's
-    # guard teardown did not leak state
     f = str(tmp_path / "fixture_test.txt")
     write(f, "fresh")
     assert read(f) == "fresh"
     rm(f)
 
 
-# ── v1.0: CLI ─────────────────────────────────────────────────────────────────
-
-from safefile._cli import main
-
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def test_cli_run_commit(tmp_path):
     f = str(tmp_path / "cli_commit.txt")
     write(f, "original")
     rc = main([
-        "run",
-        "--protect", f,
-        "--no-journal",
+        "run", "--protect", f, "--no-journal",
         "--", "python", "-c",
         f"open({repr(f)},'w',encoding='utf-8').write('modified')",
     ])
     assert rc == 0
     assert read(f) == "modified"
 
-
 def test_cli_run_rollback_on_nonzero_exit(tmp_path):
     f = str(tmp_path / "cli_rb.txt")
     write(f, "original")
     rc = main([
-        "run",
-        "--protect", f,
-        "--no-journal",
+        "run", "--protect", f, "--no-journal",
         "--", "python", "-c",
         f"open({repr(f)},'w',encoding='utf-8').write('changed'); import sys; sys.exit(1)",
     ])
     assert rc == 1
     assert read(f) == "original"
 
-
-def test_cli_status_no_orphans(tmp_path, monkeypatch):
+def test_cli_status_no_orphans(monkeypatch):
     monkeypatch.setattr("safefile._cli.find_orphaned_journals", lambda: [])
     rc = main(["status"])
     assert rc == 0
 
-
-def test_cli_status_with_orphans(tmp_path, monkeypatch):
+def test_cli_status_with_orphans(monkeypatch):
     fake = [{"temp_dir": "/tmp/safefile_fake", "backups": {"/tmp/x.txt": "/tmp/x.bak"}, "new_paths": []}]
     monkeypatch.setattr("safefile._cli.find_orphaned_journals", lambda: fake)
     rc = main(["status"])
     assert rc == 1
 
-
-def test_cli_recover_dry_run(tmp_path, monkeypatch):
+def test_cli_recover_dry_run(monkeypatch):
     fake = [{"temp_dir": "/tmp/safefile_fake", "backups": {}, "new_paths": []}]
     monkeypatch.setattr("safefile._cli.find_orphaned_journals", lambda: fake)
     monkeypatch.setattr("safefile._cli.recover_orphaned", lambda verbose=False: 0)
     rc = main(["recover", "--dry-run"])
     assert rc == 0
 
-
-def test_cli_run_missing_protect(tmp_path):
+def test_cli_run_missing_protect():
     rc = main(["run", "--", "echo", "hello"])
     assert rc == 2
-
 
 def test_cli_run_verbose(tmp_path, capsys):
     f = str(tmp_path / "cli_v.txt")
@@ -777,8 +941,64 @@ def test_cli_run_verbose(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "[safefile]" in captured.out
 
+def test_cli_run_hardlink_strategy(tmp_path):
+    f = str(tmp_path / "cli_hl.txt")
+    write(f, "original")
+    rc = main([
+        "run", "--protect", f, "--strategy", "hardlink", "--no-journal",
+        "--", "python", "-c", f"open({repr(f)},'w',encoding='utf-8').write('modified')",
+    ])
+    assert rc == 0
+    assert read(f) == "modified"
 
-# ── extra: copy strategy edge cases ──────────────────────────────────────────
+def test_cli_run_hardlink_rollback(tmp_path):
+    f = str(tmp_path / "cli_hl_rb.txt")
+    write(f, "original")
+    rc = main([
+        "run", "--protect", f, "--strategy", "hardlink", "--no-journal",
+        "--", "python", "-c",
+        f"open({repr(f)},'w',encoding='utf-8').write('changed'); import sys; sys.exit(1)",
+    ])
+    assert rc == 1
+    assert read(f) == "original"
+
+def test_cli_run_verify_flag(tmp_path):
+    f = str(tmp_path / "cli_vf.txt")
+    write(f, "original")
+    rc = main([
+        "run", "--protect", f, "--verify", "--no-journal",
+        "--", "python", "-c", "pass",
+    ])
+    assert rc == 0
+
+def test_cli_recover_yes_flag(monkeypatch):
+    monkeypatch.setattr("safefile._cli.find_orphaned_journals", lambda: [
+        {"temp_dir": "/tmp/fake", "backups": {}, "new_paths": [], "strategy": "copy"}
+    ])
+    monkeypatch.setattr("safefile._cli.recover_orphaned", lambda verbose=False: 1)
+    rc = main(["recover", "--yes"])
+    assert rc == 0
+
+def test_cli_no_subcommand_prints_help(capsys):
+    rc = main([])
+    assert rc == 0
+
+def test_cli_run_multiple_protect_files(tmp_path):
+    fa = str(tmp_path / "cli_mpa.txt")
+    fb = str(tmp_path / "cli_mpb.txt")
+    write(fa, "a-orig")
+    write(fb, "b-orig")
+    rc = main([
+        "run", "--protect", fa, fb, "--no-journal",
+        "--", "python", "-c",
+        f"open({repr(fa)},'w',encoding='utf-8').write('a-new'); open({repr(fb)},'w',encoding='utf-8').write('b-new')",
+    ])
+    assert rc == 0
+    assert read(fa) == "a-new"
+    assert read(fb) == "b-new"
+
+
+# ── copy strategy edge cases ──────────────────────────────────────────────────
 
 def test_empty_file_commit(tmp_path):
     f = str(tmp_path / "empty.txt")
@@ -856,9 +1076,9 @@ def test_deeply_nested_path_rollback(tmp_path):
             raise RuntimeError
     assert read(f) == "deep original"
 
-def test_no_files_protected_no_error(tmp_path):
+def test_no_files_protected_no_error():
     with transaction():
-        pass  # zero files — should not raise
+        pass
 
 def test_same_file_listed_twice_no_double_backup(tmp_path):
     f = str(tmp_path / "dup.txt")
@@ -870,36 +1090,7 @@ def test_same_file_listed_twice_no_double_backup(tmp_path):
     assert read(f) == "original"
 
 
-# ── extra: hardlink edge cases ────────────────────────────────────────────────
-
-def test_hardlink_multiple_files_rollback(tmp_path):
-    fa = str(tmp_path / "hl_fa.txt")
-    fb = str(tmp_path / "hl_fb.txt")
-    write(fa, "fa-orig")
-    write(fb, "fb-orig")
-    with pytest.raises(ValueError):
-        with transaction(fa, fb, strategy="hardlink"):
-            write(fa, "fa-changed")
-            write(fb, "fb-changed")
-            raise ValueError
-    assert read(fa) == "fa-orig"
-    assert read(fb) == "fb-orig"
-
-def test_hardlink_binary_file_rollback(tmp_path):
-    f = str(tmp_path / "hl_bin.bin")
-    data = bytes(range(256))
-    with open(f, "wb") as fh:
-        fh.write(data)
-    with pytest.raises(RuntimeError):
-        with transaction(f, strategy="hardlink"):
-            with open(f, "wb") as fh:
-                fh.write(b"\xff" * 256)
-            raise RuntimeError
-    with open(f, "rb") as fh:
-        assert fh.read() == data
-
-
-# ── extra: directory edge cases ───────────────────────────────────────────────
+# ── directory edge cases ──────────────────────────────────────────────────────
 
 def test_deeply_nested_dir_rollback(tmp_path):
     d = str(tmp_path / "root")
@@ -939,7 +1130,7 @@ def test_empty_dir_rollback(tmp_path):
     assert os.path.isdir(d)
 
 
-# ── extra: savepoint edge cases ───────────────────────────────────────────────
+# ── savepoint edge cases ──────────────────────────────────────────────────────
 
 def test_savepoint_on_new_file_tracks_correctly(tmp_path):
     f = str(tmp_path / "sp_new.txt")
@@ -985,7 +1176,7 @@ def test_savepoint_discard_cleans_temp_dir(tmp_path):
         assert not os.path.isdir(sp_dir)
 
 
-# ── extra: lazy backup edge cases ─────────────────────────────────────────────
+# ── lazy backup edge cases ────────────────────────────────────────────────────
 
 def test_lazy_touch_multiple_at_once(tmp_path):
     fa = str(tmp_path / "lz_ma.txt")
@@ -1007,7 +1198,7 @@ def test_lazy_touch_idempotent(tmp_path):
     with pytest.raises(RuntimeError):
         with transaction(f, lazy=True) as tx:
             tx.touch(f)
-            tx.touch(f)  # second touch — must not double-backup or crash
+            tx.touch(f)
             tx.touch(f)
             write(f, "changed")
             raise RuntimeError
@@ -1018,18 +1209,15 @@ def test_lazy_new_file_not_touched_not_removed(tmp_path):
     with pytest.raises(RuntimeError):
         with transaction(f, lazy=True) as tx:
             write(f, "created")
-            # NOT touch()'d — so it's not in new_paths either
             raise RuntimeError
-    # file was written but never registered — safefile doesn't know about it
     assert os.path.exists(f)
     rm(f)
 
 
-# ── extra: async edge cases ───────────────────────────────────────────────────
+# ── async edge cases ──────────────────────────────────────────────────────────
 
 def test_async_multiple_files_rollback():
     async def run():
-        import tempfile
         with tempfile.TemporaryDirectory() as td:
             fa = os.path.join(td, "async_fa.txt")
             fb = os.path.join(td, "async_fb.txt")
@@ -1046,7 +1234,6 @@ def test_async_multiple_files_rollback():
 
 def test_async_new_file_removed_on_rollback():
     async def run():
-        import tempfile
         with tempfile.TemporaryDirectory() as td:
             f = os.path.join(td, "async_new.txt")
             with pytest.raises(RuntimeError):
@@ -1058,21 +1245,17 @@ def test_async_new_file_removed_on_rollback():
 
 def test_async_hooks_fire():
     async def run():
-        import tempfile
         called = []
         with tempfile.TemporaryDirectory() as td:
             f = os.path.join(td, "async_hook.txt")
             write(f, "x")
-            async with async_transaction(
-                f,
-                on_commit=lambda: called.append("commit"),
-            ):
+            async with async_transaction(f, on_commit=lambda: called.append("commit")):
                 write(f, "y")
             assert called == ["commit"]
     asyncio.run(run())
 
 
-# ── extra: dry-run edge cases ─────────────────────────────────────────────────
+# ── dry-run edge cases ────────────────────────────────────────────────────────
 
 def test_dry_run_exception_still_cleans_shadow(tmp_path):
     f = str(tmp_path / "dry_exc.txt")
@@ -1106,7 +1289,7 @@ def test_dry_run_shadow_has_original_content(tmp_path):
         assert read(shadow) == "original content"
 
 
-# ── extra: verify edge cases ──────────────────────────────────────────────────
+# ── verify edge cases ─────────────────────────────────────────────────────────
 
 def test_verify_with_hardlink_strategy(tmp_path):
     f = str(tmp_path / "vf_hl.txt")
@@ -1131,10 +1314,9 @@ def test_verify_multiple_files_all_restored(tmp_path):
     assert read(fb) == "b-orig"
 
 
-# ── extra: journal edge cases ─────────────────────────────────────────────────
+# ── journal edge cases ────────────────────────────────────────────────────────
 
 def test_journal_updated_on_lazy_touch(tmp_path):
-    import json
     from safefile._transaction import Transaction
     f = str(tmp_path / "jrn_lazy.txt")
     write(f, "orig")
@@ -1148,13 +1330,11 @@ def test_journal_updated_on_lazy_touch(tmp_path):
     assert f in rec["backups"]
     tx.__exit__(None, None, None)
 
-def test_recover_orphaned_returns_zero_when_none(tmp_path, monkeypatch):
+def test_recover_orphaned_returns_zero_when_none(monkeypatch):
     monkeypatch.setattr("safefile._journal.find_orphaned_journals", lambda: [])
-    from safefile import recover_orphaned
     assert recover_orphaned() == 0
 
 def test_journal_strategy_name_persisted(tmp_path):
-    import json
     f = str(tmp_path / "jrn_strat.txt")
     write(f, "orig")
     with transaction(f, strategy="hardlink", journal=True) as tx:
@@ -1164,66 +1344,7 @@ def test_journal_strategy_name_persisted(tmp_path):
         assert rec["strategy"] == "hardlink"
 
 
-# ── extra: CLI edge cases ─────────────────────────────────────────────────────
-
-def test_cli_run_hardlink_strategy(tmp_path):
-    f = str(tmp_path / "cli_hl.txt")
-    write(f, "original")
-    rc = main([
-        "run", "--protect", f, "--strategy", "hardlink", "--no-journal",
-        "--", "python", "-c", f"open({repr(f)},'w',encoding='utf-8').write('modified')",
-    ])
-    assert rc == 0
-    assert read(f) == "modified"
-
-def test_cli_run_hardlink_rollback(tmp_path):
-    f = str(tmp_path / "cli_hl_rb.txt")
-    write(f, "original")
-    rc = main([
-        "run", "--protect", f, "--strategy", "hardlink", "--no-journal",
-        "--", "python", "-c",
-        f"open({repr(f)},'w',encoding='utf-8').write('changed'); import sys; sys.exit(1)",
-    ])
-    assert rc == 1
-    assert read(f) == "original"
-
-def test_cli_run_verify_flag(tmp_path):
-    f = str(tmp_path / "cli_vf.txt")
-    write(f, "original")
-    rc = main([
-        "run", "--protect", f, "--verify", "--no-journal",
-        "--", "python", "-c", "pass",
-    ])
-    assert rc == 0
-
-def test_cli_recover_yes_flag(tmp_path, monkeypatch):
-    monkeypatch.setattr("safefile._cli.find_orphaned_journals", lambda: [
-        {"temp_dir": "/tmp/fake", "backups": {}, "new_paths": [], "strategy": "copy"}
-    ])
-    monkeypatch.setattr("safefile._cli.recover_orphaned", lambda verbose=False: 1)
-    rc = main(["recover", "--yes"])
-    assert rc == 0
-
-def test_cli_no_subcommand_prints_help(capsys):
-    rc = main([])
-    assert rc == 0
-
-def test_cli_run_multiple_protect_files(tmp_path):
-    fa = str(tmp_path / "cli_mpa.txt")
-    fb = str(tmp_path / "cli_mpb.txt")
-    write(fa, "a-orig")
-    write(fb, "b-orig")
-    rc = main([
-        "run", "--protect", fa, fb, "--no-journal",
-        "--", "python", "-c",
-        f"open({repr(fa)},'w',encoding='utf-8').write('a-new'); open({repr(fb)},'w',encoding='utf-8').write('b-new')",
-    ])
-    assert rc == 0
-    assert read(fa) == "a-new"
-    assert read(fb) == "b-new"
-
-
-# ── extra: two additional to reach 100 ───────────────────────────────────────
+# ── misc ──────────────────────────────────────────────────────────────────────
 
 def test_transaction_returns_self_when_not_lazy_or_dry(tmp_path):
     f = str(tmp_path / "self_ret.txt")

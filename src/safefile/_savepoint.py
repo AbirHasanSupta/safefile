@@ -24,12 +24,17 @@ class Savepoint:
     ) -> None:
         self._strategy = strategy
         self._sp_dir = tempfile.mkdtemp(prefix=f"safefile_sp{sp_index}_")
-        # snapshot current file states into savepoint dir
         self._backups: Dict[str, str] = {}
         self._dirs = set(dirs)
+        # snapshot of new_paths at savepoint creation time — used to
+        # determine which paths should be deleted on rollback_to
         self._new_paths = set(new_paths)
 
-        for original, _ in backups.items():
+        for original in list(backups.keys()):
+            if not os.path.exists(original) and original not in dirs:
+                # file did not exist at savepoint time; treat as new_path
+                self._new_paths.add(original)
+                continue
             if original in dirs:
                 sp_backup = os.path.join(
                     self._sp_dir,
@@ -47,15 +52,17 @@ class Savepoint:
         for original, backup in self._backups.items():
             if original in self._dirs:
                 self._strategy.restore_dir(backup, original)
-                # restore_dir deletes backup, so don't try to clean it
             else:
                 self._strategy.restore(backup, original)
-        # remove files that did not exist at savepoint time
+        # remove files that did not exist at savepoint creation time
         for fp in self._new_paths:
             if os.path.isdir(fp):
                 shutil.rmtree(fp, ignore_errors=True)
             elif os.path.exists(fp):
-                os.remove(fp)
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
         self._cleanup()
 
     def discard(self) -> None:
