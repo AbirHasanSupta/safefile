@@ -4,7 +4,8 @@ import os
 import shutil
 import tempfile
 import threading
-from typing import Callable, Dict, List, Optional, Set, Union
+from types import TracebackType
+from typing import Callable, Dict, List, Optional, Set, Union, Type, Literal, Any, cast
 
 from ._strategies import BackupStrategy, get_strategy
 from ._savepoint import Savepoint
@@ -87,6 +88,8 @@ class Transaction:
         with self._lock:
             if fp in self._backups or fp in self._new_paths:
                 return
+            if self._temp_dir is None:
+                raise RuntimeError("Transaction not entered")
             if os.path.isdir(fp):
                 self._dirs.add(fp)
                 backup_path = os.path.join(
@@ -109,6 +112,8 @@ class Transaction:
                 self._write_journal()
 
     def _write_journal(self) -> None:
+        if self._temp_dir is None:
+            raise RuntimeError("Transaction not entered")
         write_journal(
             temp_dir=self._temp_dir,
             filepaths=list(self.filepaths),
@@ -120,7 +125,10 @@ class Transaction:
 
     # ── exit ──────────────────────────────────────────────────────────────────
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+    def __exit__(self,
+                 exc_type: Optional[Type[BaseException]],
+                 exc_val: Optional[BaseException],
+                 exc_tb: Optional[TracebackType]) -> Literal[False]:
         if self._dry_run:
             if self._dry_proxy:
                 self._dry_proxy.cleanup()
@@ -218,7 +226,7 @@ class Transaction:
     # ── rollback ──────────────────────────────────────────────────────────────
 
     def _rollback(self) -> None:
-        errors = []
+        errors: List[Exception] = []
         with self._lock:
             backups_snapshot = dict(self._backups)
             new_paths_snapshot = set(self._new_paths)
@@ -263,14 +271,20 @@ class Transaction:
 # ── async wrapper ─────────────────────────────────────────────────────────────
 
 class AsyncTransaction:
-    def __init__(self, *filepaths: str, **kwargs) -> None:
+    def __init__(self, *filepaths: str, **kwargs: Any) -> None:
         self._tx = Transaction(*filepaths, **kwargs)
 
     async def __aenter__(self) -> Transaction:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._tx.__enter__)
+        return await loop.run_in_executor(
+            None,
+            cast(Callable[[], Transaction], self._tx.__enter__)
+        )
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+    async def __aexit__(self,
+                        exc_type: Optional[Type[BaseException]],
+                        exc_val: Optional[BaseException],
+                        exc_tb: Optional[TracebackType]) -> bool:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None, lambda: self._tx.__exit__(exc_type, exc_val, exc_tb)

@@ -1,7 +1,7 @@
 import os
 import shutil
 import tempfile
-from typing import Dict
+from typing import Dict, List
 
 
 class DryRunProxy:
@@ -21,7 +21,7 @@ class DryRunProxy:
         # prod.cfg is untouched; changes went to a shadow file
     """
 
-    def __init__(self, filepaths, strategy) -> None:
+    def __init__(self, filepaths: List[str], strategy: "BackupStrategy") -> None:
         self._shadow_dir: str = tempfile.mkdtemp(prefix="safefile_dry_")
         self._map: Dict[str, str] = {}
         for fp in filepaths:

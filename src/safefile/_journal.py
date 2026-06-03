@@ -2,7 +2,7 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Any
 
 from ._exceptions import JournalError
 
@@ -67,7 +67,7 @@ def mark_committed(temp_dir: str) -> None:
         raise JournalError(path, str(exc)) from exc
 
 
-def find_orphaned_journals() -> List[Dict]:
+def find_orphaned_journals() -> List[Dict[str, Any]]:
     orphans = []
     tmp_root = tempfile.gettempdir()
     try:

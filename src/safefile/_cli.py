@@ -2,6 +2,7 @@ import argparse
 import subprocess
 import sys
 import os
+from typing import Callable, List, Optional
 
 from ._journal import recover_orphaned, find_orphaned_journals
 from ._transaction import Transaction
@@ -10,14 +11,15 @@ from ._exceptions import SafefileError
 
 
 def _fmt_bytes(n: int) -> str:
+    size: float = float(n)
     for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
 
 
-def _make_progress_cb(label: str):
+def _make_progress_cb(label: str) -> Callable[[int], None]:
     def _cb(pct: int) -> None:
         sys.stderr.write(f"\r  backing up {label}: {pct:3d}%")
         if pct >= 100:
@@ -26,7 +28,7 @@ def _make_progress_cb(label: str):
     return _cb
 
 
-def cmd_run(args) -> int:
+def cmd_run(args: argparse.Namespace) -> int:
     if not args.command:
         print("error: no command given after --", file=sys.stderr)
         return 2
@@ -81,7 +83,12 @@ def cmd_run(args) -> int:
     return result.returncode if result is not None else 1
 
 
-def _run_multi_progress(filepaths, command, strategy, verify, journal, verbose) -> int:
+def _run_multi_progress(filepaths: List[str],
+                        command: List[str],
+                        strategy: str,
+                        verify: bool,
+                        journal: bool,
+                        verbose: bool) -> int:
     """
     Back up each file individually with its own progress bar, then run the
     command inside a single combined transaction that reuses those backups.
@@ -163,7 +170,7 @@ def _run_multi_progress(filepaths, command, strategy, verify, journal, verbose) 
     return result.returncode if result is not None else 1
 
 
-def cmd_recover(args) -> int:
+def cmd_recover(args: argparse.Namespace) -> int:
     orphans = find_orphaned_journals()
     if not orphans:
         print("No orphaned transactions found.")
@@ -192,7 +199,7 @@ def cmd_recover(args) -> int:
     return 0
 
 
-def cmd_status(args) -> int:
+def cmd_status(args: argparse.Namespace) -> int:
     orphans = find_orphaned_journals()
     if not orphans:
         print("safefile: no orphaned transactions.")
@@ -204,7 +211,7 @@ def cmd_status(args) -> int:
     return 1
 
 
-def main(argv=None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="safefile",
         description="Atomic, transactional file protection for shell commands.",

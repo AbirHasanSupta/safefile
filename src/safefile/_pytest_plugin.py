@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Generator
 import pytest
 
 from ._transaction import Transaction
@@ -29,6 +29,8 @@ class SafefileGuard:
                 "safefile_guard.protect() called outside of an active test. "
                 "Ensure safefile_guard is used as a pytest fixture argument."
             )
+        if self._tx is None:
+            raise RuntimeError("Transaction not initialized")
         for p in paths:
             self._tx._register(p)
 
@@ -56,7 +58,7 @@ class SafefileGuard:
 
 
 @pytest.fixture
-def safefile_guard():
+def safefile_guard() -> Generator[SafefileGuard, None, None]:
     guard = SafefileGuard()
     guard._start()
     yield guard
@@ -64,7 +66,7 @@ def safefile_guard():
 
 
 @pytest.fixture
-def safefile_guard_hardlink():
+def safefile_guard_hardlink() -> Generator[SafefileGuard, None, None]:
     guard = SafefileGuard(strategy="hardlink")
     guard._start()
     yield guard
@@ -72,7 +74,7 @@ def safefile_guard_hardlink():
 
 
 @pytest.fixture
-def safefile_guard_verify():
+def safefile_guard_verify() -> Generator[SafefileGuard, None, None]:
     guard = SafefileGuard(verify=True)
     guard._start()
     yield guard

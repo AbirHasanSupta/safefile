@@ -1155,11 +1155,11 @@ def test_three_savepoints_rollback_to_middle(tmp_path):
     write(f, "v0")
     with transaction(f) as tx:
         write(f, "v1")
-        sp1 = tx.savepoint()
+        _sp1 = tx.savepoint()
         write(f, "v2")
         sp2 = tx.savepoint()
         write(f, "v3")
-        sp3 = tx.savepoint()
+        _sp3 = tx.savepoint()
         write(f, "v4")
         tx.rollback_to(sp2)
         assert read(f) == "v2"
@@ -1207,7 +1207,7 @@ def test_lazy_touch_idempotent(tmp_path):
 def test_lazy_new_file_not_touched_not_removed(tmp_path):
     f = str(tmp_path / "lz_newfile.txt")
     with pytest.raises(RuntimeError):
-        with transaction(f, lazy=True) as tx:
+        with transaction(f, lazy=True):
             write(f, "created")
             raise RuntimeError
     assert os.path.exists(f)
