@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "safefile"
-version = "1.1.0"
+version = "1.1.1"
 description = "Transactional file modifications – atomic, rollback on failure"
 readme = "README.md"
 license = {text = "MIT"}
@@ -13,7 +13,6 @@ authors = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -28,7 +27,7 @@ classifiers = [
     "Framework :: Pytest",
     "Typing :: Typed",
 ]
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 dependencies = []
 
 [project.optional-dependencies]

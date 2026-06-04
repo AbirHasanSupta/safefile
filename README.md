@@ -2,7 +2,7 @@
 
 **Atomic, transactional file modifications – automatic rollback on failure.**
 
-Protect files and directories from being left corrupted if your script crashes. Zero dependencies, pure Python 3.7+.
+Protect files and directories from being left corrupted if your script crashes. Zero dependencies, pure Python 3.8+.
 
 ## Installation
 
